@@ -1,10 +1,35 @@
-关于自瞄，孩子们我们要知道什么呢？
-首先，我们要有一个相机，来传入图像，相机是怎么工作的呢？请看节点node下的相机采集，检测，解算文件
-然后，一个相机有什么参数呢？请看节点node下的自瞄参数的相机部分（内参、曝光、增益、帧率）
-同时，我们要怎么得到一个相机的内参呢？你需要进行相机的标定（棋盘标定法，孩子们很简单的，你只需要一个棋盘格）
-如果我们拥有了一个标定好的相机，下一步我们要干什么呢？
-相机想要成功启动，你需要安装好对应的驱动，海康的和迈德威视的驱动不一样的。
-如果你成功启动了相机，我们就要思考了，通过相机传来的图像要怎么用呢？
-详细请看装甲板检测detect和角点points文件。
-让我们在detect和points下面见。：）（王苑）
+// 数据流：
+  ┌─────────────────────── 主线程 (感知) ──────────────────────┐
+  │                                                            │
+  │  Camera::read(img, timestamp)                              │
+  │       │                                                    │
+  │       ▼                                                    │
+  │  Solver::updateIMU(orientation, timestamp)                 │
+  │       │  ← 四元数更新 CoordConverter 内部旋转矩阵          │
+  │       ▼                                                    │
+  │  Detector::detect(rgb_image)                               │
+  │       │  → vector<Armor>                                   │
+  │       ▼                                                    │
+  │  Tracker::track(armor_list, timestamp)                     │
+  │       │  → list<TargetVariant>                             │
+  │       │     TargetVariant = variant<Target, OutpostTarget>  │
+  │       ▼                                                    │
+  │  target_queue.push(targets.front())                        │
+  │                                                            │
+  └────────────────────────────────────────────────────────────┘
+                           │
+                      线程安全队列
+                           │
+  ┌────────────────── planner线程 (控制) ─────────────────────┐
+  │                                                            │
+  │  target = target_queue.front()                             │
+  │       │                                                    │
+  │       ▼                                                    │
+  │  Planner::plan(target, bullet_speed)                       │
+  │       │  → Plan { control, fire, yaw/pitch/vel/acc }       │
+  │       ▼                                                    │
+  │  Gimbal::send(yaw, yaw_vel, yaw_acc, pitch, ...)          │
+  │                                                            │
+  └────────────────────────────────────────────────────────────┘
+
 
