@@ -1,0 +1,52 @@
+1. Color{}颜色
+2. ArmorType{}大小装甲板
+3. ArmorName{}装甲板
+4. ArmorPriority{}装甲板优先级(步兵3,4号)
+5. Struct Visualization 用于调试与可视化,
+corners :装甲板的四个角点，用于绘制四边形框，默认为空
+name :装甲板名字，默认为-1
+type :装甲板类型，默认为small
+6. Struct Lightbar 
+id :size_t无符号整数(>=0)
+color :灯条颜色
+center,top,bottom,top2bottom :中心,上端点,下端点，从 top 指向 bottom 的方向向量
+points :构成灯条轮廓的点集
+angle, angle_error, length, width,:灯条主轴与水平轴的夹角，角度拟合的误差估计，灯条的长度，灯条的宽度
+ratio :长宽比（length / width）
+rotated_rect :OpenCV 的旋转矩形对象，直接保存灯条的原始拟合结果
+7. struct Armor
+class_id ：YOLO 模型原始输出的类别索引（0~37）
+color_id ：颜色分类的独立 ID
+num_id ：装甲板数字图案分类器的输出 ID
+confidence ：检测置信度
+color，name，type，rank，priority ：枚举属性字段，颜色、名称、类型、优先级、优先级
+Lightbar left, right ：灯条的全部几何与颜色信息(灯条子结构)
+box,center,center_norm,points：几何信息字段，装甲板的轴对齐外接矩形，装甲板中心点，归一化中心坐标(除以图像尺寸)，四个角点
+ratio,side_ratio,rectangular_error：特征比例与误差字段，两灯条中点连线长度 与 较长灯条的长度 之比，较长灯条长度 与 较短灯条长度 之比，灯条与中心连线构成的夹角与 90°（π/2） 的偏差绝对值
+pattern,is_valid,duplicated：裁剪出的装甲板数字图案 ROI，综合有效性标志(通过后为true),是否被判定为重复检测（避免同一目标被多次输出）
+8. Armor()
+默认构造函数，用于创建一个空的、无效的装甲板对象
+Armor(int yolo_class_id, float confidence, const cv::Rect& box,
+                const std::vector<cv::Point2f>& keypoints);
+直接从 YOLO11 模型的输出构造 Armor。
+Armor(int color_id, int num_id, float confidence, const cv::Rect& box,
+               std::vector<cv::Point2f> armor_keypoints);
+直接从YOLO5模型的输出构造Armor。
+9. Armor(const Lightbar& left_bar, const Lightbar& right_bar)
+用途：适用于非深度学习的传统视觉流程，即通过图像处理提取左右两个灯条，再配对生成装甲板。
+10. getNameString()
+用途：将 ArmorName 枚举值转换为可读的字符串（如 "three"、"sentry" 等），方便日志、调试界面或 ROS 消息发布。
+逻辑方法：
+检查name是否在装甲板的有效名字里（one-base)
+若是，则用 ARMOR_NAMES[static_cast<int>(name) - 1] 索引预先定义的字符串数组（因为数组索引从 0 开始，而 one = 1，需减 1 对齐）。
+若不是（如 not_armor），直接返回 "not_armor" 字符串。
+11. armor_name_to_string(ArmorName name)
+inline:由于定义在头文件中，为了避免被多个源文件包含时产生重定义链接错误，声明为内联函数。
+参数：ArmorName name,待转换的装甲板部位枚举值。
+返回值：std::string 对应的字符串表示。
+实现逻辑 ：通过 switch 语句穷举所有有效的 ArmorName 枚举成员（one ~ base），分别返回其名称字符串。对于 not_armor 或任何未列出的值（default），统一返回 "not_armor"，保证了安全性。
+
+
+
+
+
