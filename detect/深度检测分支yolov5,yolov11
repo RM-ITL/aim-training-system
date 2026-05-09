@@ -1,0 +1,94 @@
+yolov5.hpp
+功能：
+- 加载 OpenVINO 加速的 YOLOv5 模型
+- 对输入的 BGR 图像 进行预处理、推理和后处理
+- 解析网络输出，结合传统视觉方法（Traditional_Detector），生成 Armor 列表
+- 提供调试可视化和日志保存功能。
+一、公有接口
+1.YOLOV5Detector(const std::string & config_path, bool debug = false);
+参数：
+config_path:配置文件路径（YAML/XML）
+debug:调试模式
+2.std::vector<Armor> detect(const cv::Mat & bgr_img, int frame_count = -1);
+输入：//bgr->rgb
+bgr_img:BGR 彩色图像
+frame_count:帧序号，用于调试保存时的命名
+输出：
+装甲板对象列表
+3.void setDebug(bool debug) { debug_ = debug; }
+功能：运行时动态打开/关闭调试模式。
+二、私有成员变量
+1. device_:OpenVINO 推理设备（如 "CPU"、"GPU"）
+2. model_path:模型文件路径
+3. save_path_:保存路径
+4. debug_:调试
+5. use_roi_：是否启用 ROI（感兴趣区域） 限制检测范围
+6. use_traditional_：是否混合使用 传统视觉方法（灯条配对）补充检测
+7. class_num_：输出类别数（13），与 armor.hpp 中枚举对应
+8. nms_threshold_：NMS（非极大值抑制）IoU 阈值
+9. score_threshold_：置信度阈值
+10. min_confidence_：最低置信度要求
+11. core_：OpenVINO 核心对象，管理插件和硬件
+12. compiled_model_：已编译的模型，可直接创建推理请求
+13. roi_：用户定义的感兴趣区域
+14. offset_：ROI 的偏移量，用于坐标补偿
+15. tmp_img_：临时图像缓冲区
+16. detector_：传统灯条检测器实例
+三、私有成员函数
+1.结果过滤
+bool check_name(const Armor & armor) const;
+bool check_type(const Armor & armor) const;
+作用：根据配置文件或内部规则，验证装甲板的名称和类型是否在允许打击列表内
+2.坐标归一化
+cv::Point2f get_center_norm(const cv::Mat & bgr_img, const cv::Point2f & center) const;
+作用：将像素中心坐标转换为归一化坐标，用于后续坐标系变换
+3.输出解析
+std::vector<Armor> parse(double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count);
+作用：将网络原始输出 cv::Mat（可能为多通道特征图）解码成 Armor 列表
+4.辅助
+void save(const Armor & armor) const;
+void draw_detections(const cv::Mat & img, const std::vector<Armor> & armors, int frame_count) const;
+double sigmoid(double x);
+作用：
+save：保存装甲板区域图像或信息到磁盘（调试用）。
+draw_detections：在原图上绘制检测结果并显示/保存。
+sigmoid：数学函数，在置信度解算中使用（ sigmoid作为激活函数）。
+
+yolov11.hpp
+功能：
+- 使用 OpenVINO 加载并运行 YOLO11 模型。
+- 接收 BGR 图像，返回 std::vector<Armor> 检测结果。
+- 内部解析 YOLO11 特有的 38 类输出，结合颜色过滤，生成符合项目数据规范的装甲板对象
+一、公有接口
+1.YOLO11Detector(const std::string& config_path, bool debug = false);
+同yolov5
+2.std::vector<Armor> detect(const cv::Mat& image, int frame_count = -1);
+同yolov5
+3.void setDebug(bool debug) { debug_ = debug; }
+同yolov5
+二、私有成员变量
+1. enemy_color_:新增敌方颜色配置
+2. 其余的同yolov5
+三、私有成员函数
+1.后处理核心
+std::vector<Armor> parse(double scale, cv::Mat& output, const cv::Mat& bgr_img, int frame_count);
+功能：将 YOLO11 模型的输出张量解析为 Armor 列表
+参数：
+scal:图像缩放因子（用于坐标还原）
+output:推理结果
+bgr_img：原始 BGR 图像，用于裁剪图案和坐标映射。
+内部会调用 YOLO11 的专用 Armor 构造函数
+2.关键点排序
+void sort_keypoints(std::vector<cv::Point2f>& keypoints);
+功能：将 YOLO11 输出的四个角点按照固定顺序排列（如左上、右上、右下、左下），确保后续几何计算的一致性。
+3.结果过滤
+bool check_name(const Armor& armor) const;
+bool check_type(const Armor& armor) const;
+功能：
+检查装甲板的名称和类型是否在允许的目标集合中
+4.坐标归一化
+cv::Point2f get_center_norm(const cv::Mat& bgr_img, const cv::Point2f& center) const;
+功能：将像素坐标转换为与图像尺寸无关的归一化坐标（常用于 PnP 解算）
+5.调试绘制
+void draw_detections(const cv::Mat& img, const std::vector<Armor>& armors, int frame_count) const;
+功能：在输入图像上绘制检测结果（框、关键点、标签等），用于可视化调试。
