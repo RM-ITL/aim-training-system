@@ -1,0 +1,600 @@
+/home/hou/Auto_aim_ITL/src/core/auto_aim/target/predictor/src/target.cpp （普通目标）
+/home/hou/Auto_aim_ITL/src/core/auto_aim/target/predictor/src/outpost_target.cpp  （前哨站目标）
+整体链路简述[detect->solerpnp->tracter(predictor)]
+"目标状态的估计predict"正是利用了上一小节提到的EKF来输出目标最优估计值，其整体链路需要结合检测器detect、解算器solvepnp、跟踪器tracker来理解。
+首先检测器detect识别到目标装甲板，产出Armor,里面包含name、type、rank等信息。
+    Armor()
+        : class_id(0),
+          color_id(0),
+          num_id(0),
+          confidence(0.0f),
+          color(red),
+          name(not_armor),
+          type(small),
+          rank(getRankFromName(not_armor)),  // 通过映射获取rank
+          ratio(0.0f),
+          rectangular_error(0.0f),
+          is_valid(false),
+          duplicated(false) {}
+然后解算器solverpnp把2D角点和IMU姿态变成Armor_pose，其中包含orld_position、world_spherical、gimbal_orientation等信息
+// 简化后的目标结构体 - 只包含世界坐标系下的信息
+struct Armor_pose {
+    armor_auto_aim::ArmorName id;        // 装甲板ID
+    armor_auto_aim::ArmorType type;      // 装甲板类型
+    Eigen::Vector3d camera_position;      // 相机坐标系位置
+    Eigen::Vector3d gimbal_position;      // 云台坐标系位置
+    Eigen::Vector3d world_position;      // 世界坐标系位置
+    SphericalCoord world_spherical;      // 世界坐标系球坐标
+    Orientation gimbal_orientation;       // 云台坐标系下的姿态
+    Orientation world_orientation;       // 世界坐标系下的姿态
+    double timestamp;
+跟踪器tracter接收这些观测数据，从检测结果中选择目标，并根据目标类型构造Target或OutposTarget，然后调用predictor对选中的目标进行运动建模和EKF估计，从而输出未来时刻目标的预测位置，最后tracter做状态机围绕“这一帧有没有成功找到并更新目标”做确认、保持、暂时容错和彻底丢弃的判断。（注意tracter和predictor之间不是并列顺承的关系，而是“上层管理器（tracter)"可调用“下层状态估计器（predictor)的关系）
+//状态机的判断结果
+//  状态一共有 5 个：
+//  - lost：完全丢失，没有有效目标
+//  - detecting：刚看到候选目标，正在累计确认帧
+//  - tracking：目标已确认，稳定跟踪
+//  - temp_lost：暂时丢失，但还保留预测，等恢复
+//  - switching：预留的切换状态
+
+void Tracker::state_machine(bool found)        
+{
+  pre_state_ = state_;  // 保存前一状态用于调试
+  
+  if (state_ == "lost") {
+    if (found) {
+      state_ = "detecting";
+      detect_count_ = 1;
+      detect_fail_count_ = 0;  // 重置失败计数
+      RCLCPP_INFO(rclcpp::get_logger("Tracker"), "状态转换: lost -> detecting");
+    }
+  }
+  else if (state_ == "detecting") {
+    if (found) {
+      detect_count_++;
+      detect_fail_count_ = 0;  // 成功时重置失败计数
+
+      // 前哨站使用独立的最小检测次数
+      int required_count = is_tracking_outpost_ ? outpost_min_detect_count_ : min_detect_count_;
+      if (detect_count_ >= required_count) {
+        state_ = "tracking";
+        RCLCPP_INFO(rclcpp::get_logger("Tracker"),
+                    "状态转换: detecting -> tracking (检测次数: %d, 前哨站: %s)",
+                    detect_count_, is_tracking_outpost_ ? "是" : "否");
+      }
+    } else {
+      // 前哨站特判：允许一定次数的检测失败
+      if (is_tracking_outpost_) {
+        detect_fail_count_++;
+        if (detect_fail_count_ > outpost_detect_fail_tolerance_) {
+          detect_count_ = 0;
+          detect_fail_count_ = 0;
+          state_ = "lost";
+          RCLCPP_INFO(rclcpp::get_logger("Tracker"),
+                      "状态转换: detecting -> lost (前哨站失败次数超限: %d)",
+                      outpost_detect_fail_tolerance_);
+        }
+        // 否则保持detecting状态，继续等待
+      } else {
+        // 普通目标：一帧失败就重置
+        detect_count_ = 0;
+        state_ = "lost";
+        RCLCPP_INFO(rclcpp::get_logger("Tracker"), "状态转换: detecting -> lost");
+      }
+    }
+  }
+  else if (state_ == "tracking") {
+    if (!found) {
+      temp_lost_count_ = 1;
+      state_ = "temp_lost";
+      RCLCPP_DEBUG(rclcpp::get_logger("Tracker"), "状态转换: tracking -> temp_lost");
+    }
+  }
+  else if (state_ == "switching") {
+    if (found) {
+      state_ = "detecting";
+      detect_count_ = 1;
+    } else {
+      temp_lost_count_++;
+      if (temp_lost_count_ > 200) {
+        state_ = "lost";
+        RCLCPP_INFO(rclcpp::get_logger("Tracker"), "状态转换: switching -> lost");
+      }
+    }
+  }
+  else if (state_ == "temp_lost") {
+    if (found) {
+      state_ = "tracking";
+      temp_lost_count_ = 0;
+      RCLCPP_DEBUG(rclcpp::get_logger("Tracker"), "状态转换: temp_lost -> tracking");
+    } else {
+      temp_lost_count_++;
+
+      // 根据目标类型设置不同的丢失容忍度
+      if (is_tracking_outpost_) {
+        max_temp_lost_count_ = outpost_max_temp_lost_count_;
+      } else {
+        max_temp_lost_count_ = normal_temp_lost_count_;
+      }
+
+      if (temp_lost_count_ > max_temp_lost_count_) {
+        state_ = "lost";
+        RCLCPP_INFO(rclcpp::get_logger("Tracker"),
+                    "状态转换: temp_lost -> lost (丢失计数: %d/%d)",
+                    temp_lost_count_, max_temp_lost_count_);
+      }
+    }
+  }
+}
+Predictor核心逻辑
+普通目标Target
+目标状态
+  x = [cx, vx, cy, vy, cz, vz, theta, omega, r, l, h]
+  z = [yaw, pitch, distance, armor_yaw]
+  // x vx y vy z vz a w r l h
+  Eigen::VectorXd x0(11);
+  x0 << center_x, 0, center_y, 0, center_z, 0, yaw, 0, r, 0, 0;
+首先是目标中心初始化，此时不直接把观测板中心当目标中心，而是用“装甲板世界坐标 + 已知半径 r * 装甲板朝向 yaw”反推出旋转中心 (center_x , center_y , center_z)。
+// 旋转中心的坐标
+  auto center_x = xyz[0] + r * std::cos(yaw);
+  auto center_y = xyz[1] + r * std::sin(yaw);
+  auto center_z = xyz[2];
+然后进入ekf预测阶段Target::predict,在该函数里面构造了11维的状态转移矩阵 F 和过程噪声 Q。
+状态转移矩阵F用于把“上一时刻估计到的目标内部状态”推到“当前时刻/未来时刻”，（而上一刻估计的目标状态就是上一帧结束后保存在ekf_x里的值，那末第一次也不是凭空而来的，是目标刚刚建立时，由首帧观测初始化而来的）。
+那末我们需要知道，这个用来预测的状态转移矩阵是线性的，也就是说，他所预测的目标是按匀速/匀角速度运动的，但是真实目标不可能完全按这个模型走，所以我们需要给预测结果流出不确定性，这个不确定性就体现在预测过程噪声的协方差矩阵Q，而Q真正生效的地方在 Auto_aim_ITL/src/core/auto_aim/target/motion_model/src/full_model.cpp:32（即下图），其中p也是一个协方差矩阵，但他描述的是“当前状态估计误差有多大”。也就是说Q作为模型噪声，进入预测公式，推进P的改变。
+[图片]
+void Target::predict(double dt)
+{
+  // 状态转移矩阵
+  Eigen::MatrixXd F(11, 11);           //x = [cx, vx, cy, vy, cz, vz, a, w, r, l, h]
+  F << 1, dt,  0,  0,  0,  0,  0,  0,  0,  0,  0,     //cx'（未来中心x) = cx(当前中心x) + vx * dt
+       0,  1,  0,  0,  0,  0,  0,  0,  0,  0,  0,     //vx' = vx
+       0,  0,  1, dt,  0,  0,  0,  0,  0,  0,  0,     //cy' = cy + vy * dt
+       0,  0,  0,  1,  0,  0,  0,  0,  0,  0,  0,     //vy' = vy
+       0,  0,  0,  0,  1, dt,  0,  0,  0,  0,  0,     //cz' = cz + vz * dt
+       0,  0,  0,  0,  0,  1,  0,  0,  0,  0,  0,     //vz' = vz
+       0,  0,  0,  0,  0,  0,  1, dt,  0,  0,  0,     //a' = a + w * dt
+       0,  0,  0,  0,  0,  0,  0,  1,  0,  0,  0,     //w' = w
+       0,  0,  0,  0,  0,  0,  0,  0,  1,  0,  0,     //r' = r
+       0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  0,     //l' = l
+       0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1;     //h' = h
+
+  // Piecewise White Noise Model
+  double v1 = 100;  // 加速度方差
+  double v2 = 400;  // 角加速度方差
+  
+  auto a = dt * dt * dt * dt / 4;
+  auto b = dt * dt * dt / 2;
+  auto c = dt * dt;
+  
+  // 预测过程噪声协方差的方差
+  Eigen::MatrixXd Q(11, 11);
+  Q << a * v1, b * v1,      0,      0,      0,      0,      0,      0, 0, 0, 0,
+       b * v1, c * v1,      0,      0,      0,      0,      0,      0, 0, 0, 0,
+            0,      0, a * v1, b * v1,      0,      0,      0,      0, 0, 0, 0,
+            0,      0, b * v1, c * v1,      0,      0,      0,      0, 0, 0, 0,
+            0,      0,      0,      0, a * v1, b * v1,      0,      0, 0, 0, 0,
+            0,      0,      0,      0, b * v1, c * v1,      0,      0, 0, 0, 0,
+            0,      0,      0,      0,      0,      0, a * v2, b * v2, 0, 0, 0,
+            0,      0,      0,      0,      0,      0, b * v2, c * v2, 0, 0, 0,
+            0,      0,      0,      0,      0,      0,      0,      0, 0, 0, 0,
+            0,      0,      0,      0,      0,      0,      0,      0, 0, 0, 0,
+            0,      0,      0,      0,      0,      0,      0,      0, 0, 0, 0;
+  
+  Q(10, 10) = 0.001;  // h高低差的过程噪声，允许缓慢的纠正
+  // Q(8, 8) = 0.001;
+  // Q(9, 9) = 0.01;
+  // 防止夹角求和出现异常值
+  auto f = [&](const Eigen::VectorXd & x) -> Eigen::VectorXd {
+    Eigen::VectorXd x_prior = F * x;
+    x_prior[6] = utils::limit_rad(x_prior[6]);
+    return x_prior;
+  };
+
+  ekf_.predict(F, Q, f);     //ekf预测方程的调用（读入构造的相关参数）    
+}
+完成了ekf预测ekf_.predict(F, Q, f)，进到下一步，但注意此时的Target::update并不是真正意义上的ekf更新，而只是用用作数据关联的板号匹配。(板号匹配只是 EKF 更新前的准备工作，不是滤波更新本身)
+所谓板号匹配，也就是先根据当前的预测状态生成所有候选装甲板的位置
+armor_xyza_list()，再拿当前的实际观测armor_pose和这些候选板逐一比较，选出最可能的那一块id。
+因为 EKF 状态描述的是“整车旋转中心 + 半径 + 高度差 + 总体角度”，不是单独某一块板。如果不先确定 id，后面就不知道该用哪一个观测模型 h(x, id)进行ekf更新。
+void Target::update(const solver::Armor_pose & armor_pose)
+{
+  // 装甲板匹配
+  int id;
+  auto min_error = 1e10;
+  const std::vector<Eigen::Vector4d> & xyza_list = armor_xyza_list();
+
+  std::vector<std::pair<Eigen::Vector4d, int>> xyza_i_list;
+  for (int i = 0; i < armor_num_; i++) {
+    xyza_i_list.push_back({xyza_list[i], i});
+  }
+
+  std::sort(
+    xyza_i_list.begin(), xyza_i_list.end(),
+    [](const std::pair<Eigen::Vector4d, int> & a, const std::pair<Eigen::Vector4d, int> & b) {
+      Eigen::Vector3d ypd1 = utils::xyz2ypd(a.first.head(3));
+      Eigen::Vector3d ypd2 = utils::xyz2ypd(b.first.head(3));
+      return ypd1[2] < ypd2[2];
+    });
+
+  // // 取前3个distance最小的装甲板
+  // double P_h = ekf_.P(10, 10);  // h的协方差
+  // double R_z = 0.01;            // z观测噪声方差
+
+  for (int i = 0; i < 3 && i < static_cast<int>(xyza_i_list.size()); i++) {
+    const auto & xyza = xyza_i_list[i].first;
+    Eigen::Vector3d ypd = utils::xyz2ypd(xyza.head(3));
+
+    // 计算角度误差
+    double angle_error = std::abs(utils::limit_rad(armor_pose.world_orientation.yaw - xyza[3])) +
+                         std::abs(utils::limit_rad(armor_pose.world_spherical.yaw - ypd[0]));
+
+    // // 计算z坐标误差（简化马氏距离：P_h大时权重小，P_h小时权重大）
+    // double z_error = std::abs(armor_pose.world_position[2] - xyza[2]);
+    // double z_error_normalized = z_error / std::sqrt(P_h + R_z);
+
+    double total_error = angle_error;
+
+    if (std::abs(total_error) < std::abs(min_error)) {
+      id = xyza_i_list[i].second;
+      min_error = total_error;
+    }
+  }
+
+  if (id != 0) jumped = true;
+
+  if (id != last_id) {
+    is_switch_ = true;
+  } else {
+    is_switch_ = false;
+  }
+
+  if (is_switch_) switch_count_++;
+
+  last_id = id;
+  update_count_++;
+
+  // 维护单板观测模式
+  if (is_switch_) {
+    no_switch_count_ = 0;
+    single_plate_mode = false;  // 发生板切换，退出单板模式
+  } else {
+    no_switch_count_++;
+  }
+  // 进入条件：长时间无切换 且 角速度低（排除高速旋转恰好看同一面的情况）
+  if (no_switch_count_ > single_plate_threshold &&
+      std::abs(ekf_.x[7]) < omega_threshold) {
+    single_plate_mode = true;
+  }
+
+  update_ypda(armor_pose, id);
+
+  // utils::logger()->info(
+  //   "[Target收敛] 更新:{} | l={:.4f} P_l={:.4f} | h={:.4f} P_h={:.4f} | ω={:.2f}rad/s | r={:.3f}",
+  //   update_count_,
+  //   ekf_.x[9], ekf_.P(9, 9),   // l 及其协方差
+  //   ekf_.x[10], ekf_.P(10, 10), // h 及其协方差
+  //   ekf_.x[7],                  // 角速度
+  //   ekf_.x[8]                   // 半径
+  // );
+
+  // // 每30帧输出一次h可观测性诊断 (约1秒一次)
+  // if (armor_num_ == 4 && update_count_ % 30 == 0) {
+  //   double obs = h_observability();
+  //   double w = omega();
+  //   double rate = id_switch_rate();
+  //   double h = ekf_.x[10];
+  //   double P_h = ekf_.P(10, 10);
+
+  //   if (obs < 0.5) {
+  //     utils::logger()->warn(
+  //       "[Target] h可观测性低! ω={:.2f}rad/s, 可观测性={:.1f}%, ID切换率={:.1f}%, h={:.3f}m, P_h={:.3f}",
+  //       w, obs * 100, rate * 100, h, P_h);
+  //   } else {
+  //     utils::logger()->debug(
+  //       "[Target] h诊断: ω={:.2f}rad/s, 可观测性={:.1f}%, ID切换率={:.1f}%, h={:.3f}m, P_h={:.3f}",
+  //       w, obs * 100, rate * 100, h, P_h);
+  //   }
+  // }
+}
+现在进入到Target::update_ypda部分，这一部分才是真正的ekf观测更新。
+此时完成了板号匹配，匹配出了id后，update_ypda() 才构造观测z = [yaw, pitch, distance, armor_yaw]，之后再用非线性观测模型 h(x,id) 和雅可比矩阵 H 做 EKF 更新ekf_.update(z, H, R, h, z_subtract); 
+void Target::update_ypda(const solver::Armor_pose & armor_pose, int id)
+{
+  // 观测jacobi
+  Eigen::MatrixXd H = h_jacobian(ekf_.x, id);
+  
+  auto center_yaw = std::atan2(armor_pose.world_position[1], armor_pose.world_position[0]);
+  auto delta_angle = utils::limit_rad(armor_pose.world_orientation.yaw - center_yaw);
+  
+  // 观测噪声，对应的是四个观测向量ypda，这里调节之后
+  Eigen::VectorXd R_dig(4);
+  R_dig << 4e-3, 4e-3, log(std::abs(delta_angle) + 1) + 1,
+           log(std::abs(armor_pose.world_spherical.distance) + 1) / 200 + 9e-2;
+
+  // 测量过程噪声协方差的方差
+  Eigen::MatrixXd R = R_dig.asDiagonal();
+
+  // 定义非线性转换函数h: x -> z
+  auto h = [&](const Eigen::VectorXd & x) -> Eigen::Vector4d {
+    Eigen::VectorXd xyz = h_armor_xyz(x, id);
+    Eigen::VectorXd ypd = utils::xyz2ypd(xyz);
+    auto angle = utils::limit_rad(x[6] + id * 2 * CV_PI / armor_num_);
+    return Eigen::Vector4d(ypd[0], ypd[1], ypd[2], angle);
+  };
+
+  // 防止夹角求差出现异常值
+  auto z_subtract = [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) -> Eigen::VectorXd {
+    Eigen::VectorXd c = a - b;
+    c[0] = utils::limit_rad(c[0]);
+    c[1] = utils::limit_rad(c[1]);
+    c[3] = utils::limit_rad(c[3]);
+    return c;
+  };
+
+  // 定义观测值，即实际解算得到的ypda
+  Eigen::VectorXd z(4);
+  z << armor_pose.world_spherical.yaw,
+       armor_pose.world_spherical.pitch,
+       armor_pose.world_spherical.distance,
+       armor_pose.world_orientation.yaw;
+
+  ekf_.update(z, H, R, h, z_subtract);        //ekf更新方程的调用（读入构造的参数）
+
+  // 非线性转换函数得到预测的ypda
+  Eigen::Vector4d z_pred = h(ekf_.x);
+  Eigen::Vector4d innovation = z_subtract(z, z_pred);
+  
+  // // 计算新息协方差 S = H * P * H^T + R
+  // Eigen::MatrixXd S = H * ekf_.P * H.transpose() + R;
+  
+  // // 计算NIS值（归一化新息平方）
+  // double nis = innovation.transpose() * S.inverse() * innovation;
+  
+  // // 记录每个维度的新息和测量噪声
+  // utils::logger()->debug(
+  //   "【EKF更新详情】更新次数:{} | 装甲板ID:{}\n"
+  //   "  观测值 z: [yaw={:.4f}, pitch={:.4f}, dist={:.3f}m, angle={:.4f}]\n"
+  //   "  预测值 h(x): [yaw={:.4f}, pitch={:.4f}, dist={:.3f}m, angle={:.4f}]\n"
+  //   "  新息 (z-h): [Δyaw={:.4f}, Δpitch={:.4f}, Δdist={:.3f}m, Δangle={:.4f}]\n"
+  //   "  测量噪声R对角线: [{:.4e}, {:.4e}, {:.4e}, {:.4e}]\n"
+  //   "  NIS值: {:.2f} (理论chi2(4)分布，95%置信区间约9.49)",
+  //   update_count_, id,
+  //   z[0], z[1], z[2], z[3],
+  //   z_pred[0], z_pred[1], z_pred[2], z_pred[3],
+  //   innovation[0], innovation[1], innovation[2], innovation[3],
+  //   R(0,0), R(1,1), R(2,2), R(3,3),
+  //   nis
+  // );
+  
+  // // 如果NIS值异常，发出警告
+  // if (nis > 15.0) {  // 远超过95%置信区间的阈值
+  //   utils::logger()->warn(
+  //     "⚠️ NIS值异常偏高！NIS={:.2f} >> 9.49\n"
+  //     "  最大新息维度: {}",
+  //     nis,
+  //     std::abs(innovation[0]) > std::abs(innovation[1]) && 
+  //     std::abs(innovation[0]) > std::abs(innovation[2]) && 
+  //     std::abs(innovation[0]) > std::abs(innovation[3]) ? "yaw角度" :
+  //     std::abs(innovation[1]) > std::abs(innovation[2]) && 
+  //     std::abs(innovation[1]) > std::abs(innovation[3]) ? "pitch角度" :
+  //     std::abs(innovation[2]) > std::abs(innovation[3]) ? "距离distance" : "装甲板angle"
+  //   );
+  // }
+}
+前哨站目标outpost_target
+outpost_target.hpp / outpost_target.cpp
+功能：
+- 面向前哨站三装甲板目标建立专用 EKF 预测模型，状态向量为 x = [cx, vx, cy, vy,cz, vz, θ, ω, r, h1, h2]。
+- 使用解算器输出的装甲板观测 solver::Armor_pose 对前哨站旋转中心、角速度、半径以及两块非基准装甲板的高度差进行跟踪。
+- 内部固定按 3 块装甲板建模：ID=0 为基准板，ID=1/2 分别对应 θ+120°、θ+240° 的两块板。
+- 通过 4 维观测 [yaw, pitch, distance, angle] 和马氏距离完成板号匹配，解决前哨站切板问题。
+- 向 Tracker 提供收敛/发散判断，向 Planner、Aimer 提供三块装甲板的预测空间位置与朝向。
+一、公有接口（outpost_target.hpp）
+1. OutpostTarget() = default;
+功能：默认构造函数，主要用于 std::variant、对象占位和拷贝场景，本身不完成任何状态初始化。
+2. OutpostTarget(const solver::Armor_pose& armor_pose,
+std::chrono::steady_clock::time_point t, double radius, Eigen::VectorXd
+P0_dig);
+OutpostTarget::OutpostTarget(
+  const solver::Armor_pose & armor_pose,
+  std::chrono::steady_clock::time_point t,
+  double radius,
+  Eigen::VectorXd P0_dig)
+: armor_type(armor_pose.type),
+  t_(t),
+  current_id_(0)
+{
+  auto r = radius;
+  const Eigen::Vector3d & xyz = armor_pose.world_position;
+  double yaw = armor_pose.world_orientation.yaw;
+
+  // 旋转中心坐标，以第一个观测为基准
+  auto center_x = xyz[0] + r * std::cos(yaw);
+  auto center_y = xyz[1] + r * std::sin(yaw);
+  auto center_z = xyz[2];  // 直接使用观测值作为基准
+
+  utils::logger()->debug(
+    "[OutpostTarget] 初始化 center_z={:.3f}, 基准角度={:.3f}",
+    center_z, yaw
+  );
+
+  // 状态向量: cx vx cy vy cz vz θ ω r h1 h2
+  Eigen::VectorXd x0(11);
+  x0 << center_x, 0, center_y, 0, center_z, 0, yaw, 0, r, 0, 0;
+
+  Eigen::MatrixXd P0 = P0_dig.asDiagonal();
+
+  auto x_add = [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) -> Eigen::VectorXd {
+    Eigen::VectorXd c = a + b;
+    c[6] = utils::limit_rad(c[6]);
+    return c;
+  };
+
+  ekf_ = motion_model::ExtendedKalmanFilter(x0, P0, x_add);
+
+  // 标记ID=0已观测
+  observed_ids_.insert(0);
+}
+功能：用首帧前哨站观测初始化 11 维 EKF 状态。内部会根据首帧装甲板位置和朝向反推旋转中心，设置初始半径和协方差，并默认将 ID=0 记为已观测。
+参数：
+armor_pose：解算器solverpnp输出的装甲板位姿。构造时主要使用 type、world_position、world_orientation.yaw。
+t：目标初始化时刻，保存到成员 t_，供后续按时间戳预测时计算 dt。
+radius：前哨站旋转中心到装甲板的半径初值。当前在 Tracker 中初始化为
+0.2765m。
+P0_dig：EKF 初始协方差对角线，顺序与状态向量一致，即 [cx, vx, cy, vy, cz,
+vz, θ, ω, r, h1, h2]。
+3. void predict(std::chrono::steady_clock::time_point t);
+void OutpostTarget::predict(std::chrono::steady_clock::time_point t)
+{
+  auto dt = utils::delta_time(t, t_);
+  predict(dt);
+  t_ = t;
+}
+功能：按“目标时刻”进行预测。内部先用 t 与上一次时间 t_ 计算时间差 dt，再调用 predict(double dt)，最后更新内部时间戳 t_。
+参数：t：需要预测到的时间点。
+4. void predict(double dt);
+void OutpostTarget::predict(double dt)
+{
+  // 状态转移矩阵
+  Eigen::MatrixXd F(11, 11);
+  F << 1, dt,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+       0,  1,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+       0,  0,  1, dt,  0,  0,  0,  0,  0,  0,  0,
+       0,  0,  0,  1,  0,  0,  0,  0,  0,  0,  0,
+       0,  0,  0,  0,  1, dt,  0,  0,  0,  0,  0,
+       0,  0,  0,  0,  0,  1,  0,  0,  0,  0,  0,
+       0,  0,  0,  0,  0,  0,  1, dt,  0,  0,  0,
+       0,  0,  0,  0,  0,  0,  0,  1,  0,  0,  0,
+       0,  0,  0,  0,  0,  0,  0,  0,  1,  0,  0,
+       0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  0,
+       0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1;
+
+  // 前哨站过程噪声
+  double v1 = 10;   // 位置加速度方差
+  double v2 = 0.1;  // 角加速度方差
+
+  auto a = dt * dt * dt * dt / 4;
+  auto b = dt * dt * dt / 2;
+  auto c = dt * dt;
+
+  // h1和h2是常量，过程噪声设小
+  double v_h = 0.0006;
+
+  Eigen::MatrixXd Q(11, 11);
+  Q << a * v1, b * v1,      0,      0,      0,      0,      0,      0,   0,   0,   0,
+       b * v1, c * v1,      0,      0,      0,      0,      0,      0,   0,   0,   0,
+            0,      0, a * v1, b * v1,      0,      0,      0,      0,   0,   0,   0,
+            0,      0, b * v1, c * v1,      0,      0,      0,      0,   0,   0,   0,
+            0,      0,      0,      0, a * v1, b * v1,      0,      0,   0,   0,   0,
+            0,      0,      0,      0, b * v1, c * v1,      0,      0,   0,   0,   0,
+            0,      0,      0,      0,      0,      0, a * v2, b * v2,   0,   0,   0,
+            0,      0,      0,      0,      0,      0, b * v2, c * v2,   0,   0,   0,
+            0,      0,      0,      0,      0,      0,      0,      0,   0,   0,   0,
+            0,      0,      0,      0,      0,      0,      0,      0,   0, v_h,   0,
+            0,      0,      0,      0,      0,      0,      0,      0,   0,   0, v_h;
+
+  auto f = [&](const Eigen::VectorXd & x) -> Eigen::VectorXd {
+    Eigen::VectorXd x_prior = F * x;
+    x_prior[6] = utils::limit_rad(x_prior[6]);
+    return x_prior; 
+  };
+
+  // 前哨站转速限制
+  if (this->convergened() && std::abs(this->ekf_.x[7]) > 2) {
+    this->ekf_.x[7] = this->ekf_.x[7] > 0 ? 2.51 : -2.51;
+  }
+
+  ekf_.predict(F, Q, f);
+}
+功能：按显式时间增量推进目标状态，使用 11 维线性状态转移矩阵和过程噪声矩阵完成 EKF 预测；同时对角度 θ 做归一化，并在已收敛时限制角速度 ω 的幅值。
+补充：（显式时间增量解释）
+predict(double dt) 的“显式时间增量推进”，是指调用方直接给出预测时间间隔 dt，模块按该时间间隔使用状态转移矩阵 F 和过程噪声矩阵 Q 将当前 EKF 状态推进到未来或过去的时刻。
+参数：dt：预测步长，单位秒，代表“从当前状态往前或往后推多长时间”。在代码中直接参与状态转移矩阵构造、过程噪声计算以及最终的ekf_.predict(F, Q, f) 调用。
+5. void update(const solver::Armor_pose& armor_pose);
+功能：用新一帧前哨站观测更新目标状态。内部先通过马氏距离匹配当前观测对应的装甲板 ID，再记录跳板/切板状态，最后调用 update_ypda() 完成 EKF 更新。
+补充：（马氏距离）
+“马式距离”用于板号匹配阶段，所谓距离指的是预测目标姿态和实际目标姿态的误差，而马式距离即是“带权重的观测误差大小”。（欧式距离没有权重）
+参数：
+armor_pose：当前帧观测。更新时主要使用 world_position、world_spherical.yaw/pitch/distance、world_orientation.yaw。
+6. Eigen::VectorXd ekf_x() const;
+功能：返回当前 EKF 状态向量（因为此时已经完成了EKF的预测和更新）。外部常用它读取旋转中心、角速度、半径等状态量。
+7. const motion_model::ExtendedKalmanFilter& ekf() const;
+功能：返回内部 EKF 对象的常量引用，供外部读取协方差矩阵等完整滤波信息。
+8. std::vector<Eigen::Vector4d> armor_xyza_list() const;
+功能：返回 3 块装甲板的预测结果列表，每个元素格式为 [x, y, z, angle]。列表
+顺序固定为 ID=0,1,2。
+9. bool diverged() const;
+功能：判断目标是否发散。当前主要检查两类情况：
+- h1/h2 是否超出合理高度范围；
+- 状态或协方差中是否出现 NaN。
+补充：（NaN）
+NaN （not a number),即非法数，是数值计算出现问题后产生的（ekf中常见来源就是雅可比矩阵计算异常、协方差更新不稳定），因为 NaN 一旦混进状态里，会快速污染后续所有计算，一旦状态或协方差检查到NaN，就说明这个目标估计已经坏掉，不能继续拿去做预测、选板、瞄准和开火。
+10. bool convergened();
+功能：判断前哨站模型是否整体收敛。代码命名就是 convergened。内部综合判断更新次数、h1/h2 收敛状态、位置协方差和速度协方差；满足条件后会锁存
+is_converged_ = true。
+11. bool h_converged() const;
+功能：单独判断两块非基准板高度差 h1/h2 是否收敛。当前条件是：P(9,9) 与 P(10,10) 都小于 0.05；至少观测到过 2 个不同装甲板 ID。
+12. bool checkinit();
+功能：返回公有标志 isinit。
+说明：当前实现中 isinit 没有被其他逻辑写入，因此该接口属于预留接口，通常返
+回默认值 false。
+补充：（isinit）
+isinit 为目标初始化状态标志，语义上用于表示 OutpostTarget 是否已完成有效初始化并进入可用状态；checkinit() 仅返回该标志值。当前版本中该标志未在构造、预测或更新流程中被写入，因此属于预留接口，暂未实际参与前哨站目标跟踪逻辑判断。
+13. const std::set<int>& observed_ids() const;
+功能：返回已经观测到的装甲板 ID 集合，主要用于收敛诊断和调试输出。
+补充：公有成员变量
+1. name：固定为 ArmorName::outpost，用于外部统一识别该目标类型。
+2. armor_type：目标装甲板类型，构造时从 armor_pose.type 初始化。
+3. priority：目标优先级，固定为 ArmorPriority::fifth。
+4. jumped：是否发生过“跳板”现象，即是否曾观测到 ID!=0 的装甲板。Aimer 会据此决定是否启用多板选点逻辑。
+5. last_id：最近一次匹配到的装甲板 ID，供外部调试和选板使用。
+6. isinit：预留初始化标志位，当前版本未真正参与状态机逻辑。
+二、私有成员变量
+1. ARMOR_NUM：固定为 3，表示前哨站按 3 块装甲板建模。
+2. H_MAX_REASONABLE：h1/h2 的最大合理高度差阈值，当前为 0.25m，用于发散判断。
+3. MATCH_GATE：马氏距离匹配门控阈值，当前为 10.0。
+4. switch_count_：装甲板 ID 切换次数计数。当前主要用于状态记录和调试。
+5. update_count_：累计更新次数，用于整体收敛判断。
+6. is_switch_：当前帧是否发生了切板。
+7. is_converged_：整体收敛锁存标志，一旦满足收敛条件后保持为真。
+8. is_h_converged_：h1/h2 收敛锁存标志。当前只在 convergened() 中被置真，没有额外对外用途。
+9. ekf_：内部的 motion_model::ExtendedKalmanFilter 实例，保存当前状态和协方差。
+10. t_：最近一次基于时间点预测时使用的时间戳基准。
+11. observed_ids_：历史已观测到的装甲板 ID 集合，用于判断高度差参数是否具备可观测性。
+12. current_id_：内部当前跟踪的装甲板 ID。当所有候选匹配都不可靠时，会回退到该ID。
+三、私有成员函数
+1. double get_predicted_z(int id) const;
+功能：根据装甲板 ID 返回对应预测高度。
+参数：id：装甲板编号，0/1/2。
+说明：当前主流程未使用，保留用于调试。
+2. Eigen::VectorXd predict_observation(const Eigen::VectorXd& x, int id)
+const;
+功能：将给定状态 x 和装甲板 ID 映射为 4 维预测观测 [yaw, pitch, distance,
+angle]，供匹配阶段使用。
+参数：
+x：11 维目标状态向量。
+id：待假设的装甲板编号。
+3. Eigen::MatrixXd compute_R(const solver::Armor_pose& armor_pose) const;
+功能：根据实际观测值构造 4 维观测噪声矩阵 R。
+参数：armor_pose：当前观测。
+说明：当前版本中该函数没有直接参与 match_by_mahalanobis() 或 update_ypda()主流程，属于保留实现。
+4. Eigen::MatrixXd compute_R_from_prediction(const Eigen::VectorXd& z_pred)const;
+功能：根据预测观测 z_pred 构造观测噪声矩阵 R，匹配逻辑参考了 wust_vision 的做法。
+参数：z_pred：4 维预测观测 [yaw, pitch, distance, angle]。
+作用：在马氏距离匹配时为不同姿态、不同距离下的观测分配不同噪声权重。
+5. int match_by_mahalanobis(const solver::Armor_pose& armor_pose);
+功能：前哨站切板匹配核心。它会分别假设当前观测来自 ID=0/1/2，计算三种情况下的预测观测与残差，再用 R^-1 计算马氏距离，最终选出最优 ID。
+参数：armor_pose：当前装甲板观测。
+作用：解决“同一个前哨站不同板被相机轮流看到”时的板号归属问题。
+补充：若所有候选 ID 都超过门控阈值，当前实现不会直接放弃，而是退化为选择最小马氏距离的 ID；如果连有效最小值都没有，再保持 current_id_。
+6. void update_ypda(const solver::Armor_pose& armor_pose, int id);
+功能：执行 4 维观测更新，观测量为 [yaw, pitch, distance, angle]。其中 h1/h2
+并不是被直接观测，而是通过 pitch 和 distance 对高度的非线性敏感性间接更新。
+参数：
+armor_pose：当前观测。
+id：本次观测匹配到的装甲板编号。
+作用：完成前哨站 EKF 的观测修正，是 update() 的核心更新函数。
+7. Eigen::Vector3d h_armor_xyz(const Eigen::VectorXd& x, int id) const;
+功能：根据状态向量和装甲板 ID 计算该装甲板在世界坐标系下的三维位置。
+参数：x：11 维目标状态。
