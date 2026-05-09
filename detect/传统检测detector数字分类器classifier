@@ -1,0 +1,29 @@
+classifier.hpp
+功能：
+负责识别装甲板上的数字图案，将其归类为具体的 ArmorName（如 1~5 号、哨兵、前哨站等），是自瞄系统中区分不同敌方单位的关键模块。
+一、公有接口
+1.explicit Classifier(const std::string & config_path);
+功能：接受配置文件路径，其中，explicit是禁止隐式转换，确保配置来源明确
+2.void classify(Armor & armor);和void ovclassify(Armor & armor);
+功能：都接收一个 Armor 对象的引用，在内部对 armor.pattern（裁剪出的数字图案）进行推理，并将结果写回 armor.num_id、armor.name 等字段。
+区别：classify使用OpenCV DNN 模块（cv::dnn::Net）进行推理
+             ovclassify使用OpenVINO（ov::Core / ov::CompiledModel）进行推理
+二、私有成员变量
+1. net_:OpenCV DNN 网络对象，用于加载和运行分类模型（可能为 ONNX 或 Caffe 格式）
+2. core_:OpenVINO 核心对象，管理推理引擎。
+3. compiled_model_:已编译的 OpenVINO 模型，可直接创建推理请求，加速执行。
+与Amor的交互
+classify / ovclassify 被调用前，Armor 中的 pattern 必须已经被填充（由检测器在构造时通过透视变换裁剪得到）。分类器执行以下步骤：
+1. 预处理：将 pattern 缩放至模型输入尺寸，归一化等。
+2. 推理：得到类别概率分布（共 9 类：one~base + not_armor）。
+3. 结果解析：
+  - 取最大概率类别索引，赋值 armor.num_id。
+  - 映射为 ArmorName 枚举，写入 armor.name（如 three、sentry）。
+  - 同步更新 armor.rank（通过 Armor::getRankFromName）和 armor.priority。
+4. 有效性判断：若置信度低于阈值或结果为 not_armor，可能置 armor.is_valid = false。
+
+classifier完整实现
+1. 映射表：分类器认为模型输出 0~8 共 9 个类别，依次对应九种 ArmorName，包括无效装甲板 not_armor。
+2. Classifier()根据配置文件初始化 OpenCV DNN 网络（net_）和 OpenVINO 编译模型（compiled_model_）
+3. classify方法：空图保护->灰度转换与缩放->缩放与全黑填充->推理与 Softmax->取最大概率类别
+4. ovclassify方法：空图保护->灰度转换与缩放->缩放与全黑填充->归一化与张量创建->推理与 Softmax ->取最大概率类别
