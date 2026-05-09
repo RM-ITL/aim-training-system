@@ -1,0 +1,228 @@
+ gimbal.hpp
+  功能：
+- 负责视觉与下位机云台之间的串口通信。
+- 接收下位机回传的模式、四元数、yaw/pitch、角速度、弹速、弹丸计数等状态信息。
+- 向下位机发送控制命令，包括控制使能、开火标志、yaw/pitch 角度、角速度、角加速度。
+- 维护一个四元数时间队列，为上层模块提供按图像时间戳插值后的姿态q(timestamp)。
+- 提供串口异常检测与自动重连机制，保证长期运行稳定性。
+- 对下位机 IMU 四元数进行外参标定补偿，输出校正后的姿态结果。
+一、公有接口
+  
+1. Gimbal(const std::string & config_path);
+参数：config_path：YAML 配置文件路径。
+功能：初始化 Gimbal 通信模块，主要完成：
+读取串口端口 -> 读取四元数标定参数 q_calib -> 配置串口超时和波特率 -> 打开串口 -> 启动后台读线程 read_thread
+2. ~Gimbal();
+功能：析构时安全关闭模块。(调用 stop()；等待读线程退出；关闭串口)
+3. void stop();
+功能：停止 Gimbal 模块运行。将 quit_ 置位，并调用 queue_.shutdown() 唤醒可能阻塞在 q() 中等待姿态数据的线程。
+4. GimbalMode mode() const;
+输出：当前云台模式枚举 GimbalMode。
+功能：线程安全地返回最近一次收到的下位机模式状态。
+5. GimbalState state() const;
+输出：当前云台状态结构体 GimbalState。
+功能：线程安全地返回最近一次收到的 yaw、pitch、角速度、弹速和弹丸计数等状态。
+6. std::string str(GimbalMode mode) const;
+参数：mode：云台模式枚举。
+输出：模式对应的字符串。
+功能：将枚举模式转换为可读字符串，便于日志和调试显示。
+映射关系：
+IDLE -> "IDLE"
+AUTO_AIM -> "AUTO_AIM"
+SMALL_BUFF -> "SMALL_BUFF"
+BIG_BUFF -> "BIG_BUFF"
+7. Eigen::Quaterniond q(std::chrono::steady_clock::time_point t);
+参数：t：目标时间戳，通常是图像时间戳。
+输出：在时刻 t 对应的姿态四元数。
+功能：从内部四元数时间队列中取相邻两帧姿态，做球面线性插值 slerp，返回与图像时间对齐的四元数。
+说明：这是自瞄主链路里最关键的时间对齐接口，hero、standard3、test_node_deep 等节点都会用 gimbal_->q(timestamp) 获取图像对应姿态。当前实现中如果连续 200 次仍无法完成插值，会直接返回单位四元数，避免线程卡死。
+8. void send(bool control, bool fire, float yaw, float yaw_vel, float yaw_acc, float pitch, float pitch_vel, float pitch_acc);
+输入：
+control：是否控制云台。
+fire：是否开火。
+yaw：目标 yaw 绝对角度，单位弧度。
+yaw_vel：目标 yaw 角速度。
+yaw_acc：目标 yaw 角加速度。
+pitch：目标 pitch 绝对角度，单位弧度。
+pitch_vel：目标 pitch 角速度。
+pitch_acc：目标 pitch 角加速度。
+功能：将控制命令写入内部发送缓存 tx_data_，并通过串口发送给下位机。
+模式编码规则：
+control = false -> mode = 0
+control = true, fire = false -> mode = 1
+control = true, fire = true -> mode = 2
+说明：当串口未打开或正在重连时，函数会直接返回，不发送数据。
+9. void send(io::VisionToGimbal VisionToGimbal);
+输入：VisionToGimbal：已打包好的完整发送结构体。
+功能：允许上层直接传入完整协议结构体，绕过布尔/标量参数接口，直接发送控制包。
+说明：内部仍会把结构体拷贝到 tx_data_ 后统一通过串口发送。
+10. void push_quaternion(const Eigen::Quaterniond& q, std::chrono::steady_clock::time_point t);
+输入：
+q：四元数。
+t：对应时间戳。
+功能：将外部提供的四元数和时间戳压入内部队列。
+补充：当前主流程里通常由 read_thread() 自动推入校正后的四元数，但这个接口保留了手工推入能力，便于扩展或测试。
+二、私有成员变量
+1. serial_：串口对象。
+作用：负责底层串口设备的打开、关闭、读写。
+2. serial_mutex_：串口读写互斥锁。
+作用：保护 serial_ 的读写，避免读线程和发送线程并发访问串口导致数据竞争。
+3. reconnecting_：重连标志，原子变量。
+作用：表示当前模块是否处于重连状态。在该标志为真时，send() 会直接返回，不再尝试写串口。
+4. thread_：后台读线程。
+作用：持续执行 read_thread()，接收下位机数据并更新状态。
+5. quit_：退出标志，原子变量。
+作用：控制后台读线程和姿态查询接口的退出流程。
+6. mutex_：状态互斥锁。
+作用：保护 mode_、state_ 等共享状态。
+7. rx_data_：接收数据缓存，类型为 GimbalToVision。
+作用：临时保存串口收到的一整帧“下位机 -> 视觉”数据。
+8. tx_data_：发送数据缓存，类型为 VisionToGimbal。
+作用：临时保存即将通过串口发送的一整帧“视觉 -> 下位机”控制数据。
+9. mode_：当前云台模式。
+作用：保存最近一次有效接收帧解码出的模式状态。
+10. state_：当前云台状态。
+作用：保存最近一次有效接收帧中的 yaw、pitch、角速度、弹速、弹丸计数等状态。
+11. queue_：四元数时间队列。
+作用：缓存一段时间内的姿态四元数及其时间戳，供 q(timestamp) 做插值。
+说明：队列类型为：
+ThreadSafeQueue<std::tuple<Eigen::Quaterniond,std::chrono::steady_clock::time_point>>容量固定为 1000。
+12. q_calib_：IMU 外参标定四元数。
+作用：对下位机上传的原始四元数做姿态补偿。当前实现使用：
+q_corrected = q_calib_ * q_lower
+其中 q_lower 是下位机上传的姿态四元数。
+三、私有成员函数
+1. 串口读取
+int read_serial(uint8_t * buffer, size_t size);
+输入：
+buffer：数据缓冲区。
+size：期望读取字节数。
+输出：
+1：成功读取完整数据。
+0：超时无数据。
+-1：设备异常或串口读失败。
+作用：线程安全地从串口读取指定长度的字节流，是底层读取封装函数。
+2. 后台接收线程
+void read_thread();
+作用：持续接收下位机数据帧，完成整个接收链路。
+具体流程：
+读取帧头 -> 校验帧头是否为 'G' 'V' -> 继续读取剩余数据 -> 校验帧尾是否为 'G' -> 解析模式、yaw、pitch、角速度、弹速、弹丸计数  -> 解析四元数 -> 利用 q_calib_ 校正四元数 -> 将校正后的四元数压入队列 -> 更新 mode_ 和 state_。
+补充：这是整个 Gimbal 类的核心后台逻辑。它还会统计错误计数，当错误次数超过阈值后触发重连。
+3. 串口重连
+void reconnect();
+作用：在串口异常、设备掉线或多次读取失败后，尝试关闭并重新打开串口。
+流程：
+置 reconnecting_ = true -> 循环尝试关闭串口 -> 等待 2 秒 -> 重新 open() -> 成功后清除重连标志并返回 -> 失败则继续循环直到退出。
+说明：重连期间所有发送接口都会短路返回，防止异常写串口。
+四、相关通信结构体与枚举
+1. GimbalCommand
+作用：这是自瞄内部用于表达“基础控制命令”的轻量结构体。
+成员：
+control：是否控制云台。
+shoot：是否射击。
+yaw：目标 yaw。
+pitch：目标 pitch。
+说明：该结构体主要被 Aimer、Shooter 等模块使用，不直接等同于串口协议结构体。
+2. GimbalToVision
+作用：表示“下位机 -> 视觉”的串口协议数据帧。
+成员：
+head[2] = {'G', 'V'}：帧头。
+mode：当前模式，0/1/2/3。
+q[4]：四元数，顺序为 wxyz。
+yaw：当前云台 yaw，绝对弧度值。
+yaw_vel：当前 yaw 角速度。
+pitch：当前云台 pitch，绝对弧度值。
+pitch_vel：当前 pitch 角速度。
+bullet_speed：当前弹速。
+bullet_count：累计发弹次数。
+tail = 'G'：帧尾。
+说明：该结构体带 attribute((packed))，保证串口通信时内存布局紧凑一致。
+3. VisionToGimbal
+作用：表示“视觉 -> 下位机”的串口协议数据帧。
+成员：
+head[2] = {'V', 'G'}：帧头。
+mode：
+0：不控制
+1：控制云台但不开火
+2：控制云台且开火
+yaw：目标 yaw。
+yaw_vel：目标 yaw 角速度。
+yaw_acc：目标 yaw 角加速度。
+pitch：目标 pitch。
+pitch_vel：目标 pitch 角速度。
+pitch_acc：目标 pitch 角加速度。
+tail = 'V'：帧尾。
+说明：发送接口最终都会把控制量写入这个结构体，再统一通过串口下发。
+4. GimbalMode
+作用：表示当前云台工作模式的枚举类型。
+枚举值：
+IDLE
+AUTO_AIM
+SMALL_BUFF
+BIG_BUFF
+说明：read_thread() 会根据下位机回传的 mode 字段把原始数字映射成这个枚举。
+5. GimbalState
+作用：表示视觉侧缓存的最新云台状态。
+成员：
+yaw
+yaw_vel
+pitch
+pitch_vel
+bullet_speed
+bullet_count
+说明：这是上层节点最常用的读状态接口返回类型。
+五、姿态插值与时间对齐逻辑
+1. q(timestamp) 的核心目标
+作用：让视觉在处理某一帧图像时，不是使用“当前最新姿态”，而是使用“图像曝光对应时刻的姿态”。这样可以尽量减小：
+- 图像采集延迟；
+- 串口传输延迟；
+- 云台运动导致的时序误差。
+2. 插值过程
+作用：q() 会从队列中取出两帧相邻姿态：
+(q_a, t_a)
+(q_b, t_b)
+然后计算：k = delta(t_a, t) / delta(t_a, t_b)
+再执行：q_c = q_a.slerp(k, q_b)最终返回 q_c。
+说明：这里用的是四元数球面线性插值，不是欧拉角线性插值，因此对旋转插值更稳定。
+3. 超时保护
+作用：如果连续尝试很多次仍无法找到合适时间区间，q() 会返回单位四元数。
+意义：防止主线程因为姿态等待而卡死。
+六、错误处理与重连逻辑
+1. 错误计数规则
+作用：read_thread() 不会把所有“无数据”都判成错误。
+当前规则是：
+串口超时无数据 -> 视为正常，不累计错误 -> 读异常、帧头错误、剩余数据读取失败、帧尾错误 -> 累计错误。
+2. 重连触发条件
+作用：当错误计数超过 100 后，会触发 reconnect()。
+意义：避免偶发单帧异常就触发重连，同时在设备拔插、串口掉线时又能自动恢复。
+3. 发送保护
+作用：当 reconnecting_ == true 或串口未打开时，两个 send() 接口都会直接返回。
+意义：防止重连过程中继续发送无效数据，导致异常堆积。
+七、配置参数说明
+1. com_port
+作用：串口端口路径，例如：
+/dev/gimbal
+/dev/ttyACM0
+说明：当前实现直接从顶层键读取该参数。
+2. q_calib
+作用：四元数标定补偿参数。格式：
+x
+y
+z
+w
+作用公式：q_corrected = q_calib_ * q_lower
+意义：用于修正下位机 IMU 姿态与视觉坐标系之间的固定安装误差。
+3. enable_serial
+作用：从配置语义上看表示是否启用串口。
+说明：当前 gimbal.cpp 实现中并没有实际读取或判断这个参数。
+4. com_port_1
+作用：配置文件中预留的第二串口端口。
+说明：当前 gimbal.cpp 实现中没有实际使用它。
+八、当前实现需要特别注意的点
+1. 配置读取行为
+作用：当前构造函数读取的是顶层com_port，不是 Gimbal["com_port"]。因此文档和配置维护时需要注意代码真实读取路径。
+2. 波特率固定
+作用：当前实现写死serial_.setBaudrate(115200);
+说明：虽然配置文件里别的模块有 baud，但 Gimbal 本身不从 YAML 读取波特率。
+3. enable_serial 当前未接入逻辑
+作用：配置文件里虽然有 enable_serial，但当前实现没有用它控制是否打开串口。
