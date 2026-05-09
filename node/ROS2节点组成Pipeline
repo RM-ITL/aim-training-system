@@ -1,0 +1,160 @@
+一、node
+1.standard
+属于应用层，封装了相机采集、目标检测、位姿解算、跟踪、规划、云台通信、射击控制等全部子模块，并通过多线程和线程安全队列将它们串联成一个实时处理流水线。
+其启动时如果不加配置参数，使用的是默认参数"/src/config/sentry.yaml"
+所以例如， ros2 run test_pipeline deep_node /src/standard3.yaml
+                       ros2 run test_pipeline deep_node /src/standard4.yaml
+一、公有接口
+1.explicit Standard3App(const std::string & config_path);
+功能：通过配置文件路径构造，内部完成所有子模块的初始化、线程创建等。
+2.~Standard3App()；
+功能：负责安全停止线程、释放资源。
+3.int run()；
+功能：启动应用程序主循环
+4.void request_stop()；
+功能：发出停止信号，让 run() 或内部线程退出。
+二、私有成员变量
+1. config_path_：配置文件路径
+2. camera_：相机驱动
+3. detector_：装甲板检测器
+4.  solver_：位姿解算器
+5. yaw_optimizer_：裸指针，指向偏航角优化器
+6. tracker_：目标跟踪器
+7. planner_：行动规划器
+8. gimbal_：云台通信接口
+9. shooter_：射击控制
+10. target_queue:线程安全队列
+11. quit_:停止标志
+12. planner_thread_:规划器专用线程
+13. start_time_:程序启动时间戳
+14. bullet_speed_:弹速（20 m/s）
+三、私有成员函数
+1.void planner_loop()；
+功能：规划线程的主函数，不断从 target_queue 中获取最新目标，调用 Planner 进行决策，并将指令发送给 Gimbal 和 Shooter。
+主线程（run）                        规划线程（planner_loop）
+   │                                 │
+   ├─ camera_->read()               │
+   ├─ detector_->detect()           │
+   ├─ tracker_->track()             │
+   ├─ target_queue.push() ───→   ├─ target_queue.front()
+   │                                ├─ planner_->plan()
+   │                                ├─ shooter_->checkfire()
+   │                                └─ gimbal_->send()
+   └─ (循环)                        └─ (循环)
+2.hero
+同standard3
+3.sentry
+1.命名空间Application
+类型别名：
+using Armors = armor_auto_aim::Armor;
+using Visualization = armor_auto_aim::Visualization;
+2.结构体DebugPacket
+功能：封装主线程传递给可视化线程的调试数据包
+参数：
+rgb_image:当前帧的 RGB 图像(bgr->rgb)
+reprojected_armors:所有跟踪目标重投影到图像上的可视化数据列表（角点、类型、名称）
+tracker_state:当前跟踪器的状态字符串
+vaild:标记此数据包是否有效(默认为false),主线程填充后为true
+struct DebugPacket
+{
+  cv::Mat rgb_image;
+  std::vector<Visualization> reprojected_armors;
+  std::string tracker_state;
+  bool valid{false};
+};
+优点：可以把绘制的过程从主线程中剥离，避免 OpenCV 显示操作影响实时检测流水线。(延迟小)
+3.枚举SentryRunMode
+enum class SentryRunMode
+{
+  Direct,
+  Bridge,
+};
+Direct:直接控制模式
+Bridge:ROS2模式
+一、公有接口
+1.explicit PipelineApp(const std::string & config_path);
+功能：加载配置，初始化所有模块和 ROS 通信，启动线程组。
+2.~PipelineApp();
+功能：请求停止，等待所有线程结束，释放资源
+3.int run();
+功能：同上
+4.void request_stop();
+功能：同上
+二、私有成员变量
+ target_queue：容量为1,目的是为了保证获得最新的一帧的目标，旧数据会被自动丢弃
+visualization_queue：容量为2,目的时为了平滑帧率，减少丢帧
+ros通信
+1. ros_node_：ROS2 节点，用于参数声明、话题创建。
+2. debug_pub_：发布调试信息（控制量、开火率等）。
+3. orientation_pub_：发布当前姿态四元数。
+4. target_pub_：发布目标信息
+5. gimbal_cmd_pub_：发布云台控制指令
+6. gimbal_state_sub_：订阅云台状态
+可视化
+1. visualization_queue：线程安全队列，传递 DebugPacket 给可视化线程
+2. visualization_thread_：可视化线程句柄。
+3. enable_visualization_：是否启用可视化窗口。
+4.  visualization_window_name_：窗口标题字符串
+5. visualization_center_point_：视觉参考中心点
+6. visualization_frame_counter_：可视化帧计数器
+运行模式
+1. run_mode_：运行模式枚举（Direct / Bridge）
+2. run_mode_name_：模式名称字符串
+3. sentry_：直连云台硬件接口
+bridge模式
+1. bridge_state_mutex_：保护 Bridge 状态数据的互斥锁
+2. bridge_has_state_：是否已收到首次云台状态
+3. bridge_state_：缓存的最新云台状态
+4. bridge_orientation_：缓存的最新姿态四元数
+性能
+1. delay_window_：系统延迟记录窗口
+2. delay_window_size_：延迟统计窗口大小
+3. last_delay_log_time_：上次输出延迟日志的时间点
+4. last_state_wait_log_time_：上次提示等待云台状态的时间点
+5. fire_window_：滑动窗口记录开火指令（时间戳 + 是否开火）
+6. fire_window_sec_：开火统计窗口时长（10 秒）
+7. spin_thread_：Bridge 模式下负责 rclcpp::spin_some 的线程
+三、私有成员函数
+1.void start_threads();
+功能：初始化并启动所有辅助线程，
+1. 重置退出标志 quit_ = false，清零 visualization_frame_counter_
+2. 若 planner_ 存在，创建 planner_thread_ 执行 planner_loop
+3. 若 enable_visualization_ 为真，创建 visualization_thread_ 执行 visualization_loop(可视化)
+4. 若运行模式为 Bridge，启动 spin_thread_ 循环调用 rclcpp::spin_some(ros_node_) 以处理 ROS 回调（如云台状态订阅）。所有线程均以 quit_ 作为退出条件
+2.void join_threads();
+功能：等待所有工作线程结束
+检查 planner_thread_、visualization_thread_、spin_thread_ 是否可joinable,若是则join(),主要目的是保证在对象析构前所有线程已退出，避免资源泄漏或未定义行为。
+3.void visualization_loop();
+功能：可视化线程主函数，绘制调试图像，将绘制移出主线程，避免影响检测实时性
+4. void planner_loop();
+功能：规划线程主函数，独立线程来保证控制的稳定性和低延迟。
+5.void gimbal_state_callback(const autoaim_msgs::msg::GimbalState::SharedPtr msg);
+功能：Bridge 模式下接收云台状态话题的回调函数
+1. 将消息中的 yaw、pitch、yaw_vel、pitch_vel、bullet_speed、bullet_count 更新到 bridge_state_ 结构体
+2. 解析四元数 orientation，若范数过小则设为单位四元数，否则归一化后存入 bridge_orientation_
+3. bridge_has_state_ = true;，标记已收到有效状态
+6.bool has_runtime_state() const;
+功能：判断是否已获得有效的云台状态，允许主循环进入检测
+Direct：有硬件连接即可，只要 sentry_ 非空即返回 true
+Bridge:至少收到过一次 GimbalState 消息
+7.io::GimbalState runtime_state() const;
+功能：获取当前云台状态
+Direct:调用 sentry_->state() 从硬件直接读取最新状态
+Bridge:在互斥锁保护下返回 bridge_state_副本
+8.Eigen::Quaterniond runtime_orientation(std::chrono::steady_clock::time_point timestamp) const;
+功能：获取当前云台姿态四元数
+Direct:调用 sentry_->q(timestamp) 获取 IMU 姿态
+Bridge:互斥锁保护下返回缓存的 bridge_orientation_
+9.void output_control(const plan::Plan & plan_result, const io::GimbalState & gs);
+功能：将规划结果转化为实际硬件控制指令并发送
+有二次安全检查
+Direct：
+send_mode编码:
+- 为0,不控制（safe = false），云台保持原状
+- 为1,控制但不允许开火（safe = true but fire = false）
+- 为2,控制且允许开火（safe = true and fire = true）
+Bridge:ROS 话题发布
+- 构建自定义 ROS 消息 GimbalCmd
+- 打上当前 ROS 时间戳
+- 通过预先创建的发布器 gimbal_cmd_pub_ 发布到 /gimbal/cmd 话题，由下层驱动节点接收并执行
+(在构造函数中创建的发布器，在这里发布)
