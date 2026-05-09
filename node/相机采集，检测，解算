@@ -1,0 +1,155 @@
+/home/robot/Auto_aim-main/src/test_node/src/camera_calib_node.cpp
+/home/robot/Auto_aim-main/src/test_node/src/capture_node.cpp
+/home/robot/Auto_aim-main/src/test_node/src/handeye_calib_node.cpp
+camera_calib_node.cpp
+  功能：
+- 从采集文件夹中批量读取圆点标定板图像。
+- 对每张图像执行对称圆点板检测。
+- 基于检测到的 2D 圆心和预设 3D 圆心模板执行相机内参标定。
+- 计算平均重投影误差，并以 YAML 片段形式输出相机内参结果。
+- 可选显示每张图像上的圆点检测可视化结果。
+一、公有接口
+  
+1. CameraCalibApp(std::string input_folder, bool show_detection);
+功能：构造相机内参标定应用对象。
+参数：
+input_folder：输入数据文件夹路径，内部应包含按序号命名的标定图像。
+show_detection：是否显示圆点板检测结果窗口。
+2. int run();
+功能：执行完整的相机内参标定流程。主要步骤包括：
+- 枚举输入文件夹中的样本图像；
+- 构造圆点板 3D 模板点；
+- 对每张图像执行圆点检测；
+- 收集有效样本的 2D/3D 对应关系；
+- 调用 cv::calibrateCamera() 求解相机内参和畸变参数；
+- 统计平均重投影误差；
+- 输出 YAML 格式结果。
+返回值：
+0 表示执行成功；
+1 表示样本为空、有效样本不足或运行失败。
+二、私有成员变量
+1. pattern_config_
+功能：圆点板配置，类型为 calibration::PatternConfig。内部包含圆点板尺寸和圆心间距，用于生成 3D 模板点以及执行圆点检测。
+2. input_folder_
+功能：输入数据文件夹路径。
+3. show_detection_
+功能：是否显示检测可视化窗口。
+4. window_name_
+功能：检测结果显示窗口名称，当前固定为 "camera_calib_node"。
+capture_node.hpp / capture_node.cpp
+  功能：
+- 初始化相机、云台和 IMU 设备，实时读取图像与姿态信息。
+- 在预览窗口中显示缩放后的实时图像、IMU 欧拉角信息以及圆点板检测结果。
+- 仅在当前帧成功检测到圆点板时，保存图像、四元数和时间戳。
+- 为后续相机内参标定和手眼标定生成离线数据集。
+一、公有接口
+1. explicit CaptureApp(const std::string& config_path, const std::string& output_folder);
+功能：构造采集应用，初始化 ROS 节点、相机、云台、IMU，并创建输出目录。
+参数：
+config_path：YAML 配置文件路径，用于初始化相机、云台和 IMU。
+output_folder：采集结果输出目录，保存图像、四元数和时间戳文件。
+2. ~CaptureApp();
+功能：析构时调用 request_stop()，将退出标志置位，保证主循环安全结束。
+3. int run();
+功能：执行实时采集主循环。主要流程包括：
+- 从相机读取图像与时间戳；
+- 从 IMU 读取与当前时间对齐的四元数；
+- 根据相机类型决定是否做颜色空间转换；
+- 绘制姿态角文本并执行预览级圆点板检测；
+- 响应键盘输入：q 退出，s 保存；
+- 在保存前对全分辨率图像再次执行圆点板检测；
+- 若检测成功，则保存图像、四元数和时间戳。
+返回值：
+0 表示正常结束。
+4. void request_stop();
+位置：头文件 27 行声明，源文件 149-152 行定义。
+功能：设置退出标志 quit_，使采集主循环停止。
+二、私有成员变量
+1. config_path_
+功能：设备初始化所用配置文件路径。
+2. output_folder_
+功能：采集结果输出目录。
+3. camera_
+功能：相机设备对象，负责读取图像和时间戳。
+4. gimbal_
+功能：云台设备对象。当前主流程中未实际取云台四元数，代码保留了相关接口。
+5. dm_imu_
+功能：IMU 设备对象，当前主流程通过它获取与图像时间对齐的四元数姿态。
+6. ros_node_
+功能：ROS2 节点对象，节点名为 "capture_node"。
+7. quit_
+功能：线程安全的退出标志，控制采集循环停止。
+8. pattern_size_
+功能：对称圆点板尺寸，当前为 11 x 8，用于检测时的圆点阵列规格。
+9. circle_spacing_mm_
+功能：圆点中心间距，单位毫米，用于日志提示和标定板信息说明。
+10. circle_diameter_mm_
+功能：圆点直径，单位毫米，仅用于日志提示。
+11. board_size_mm_
+功能：标定板物理尺寸，单位毫米，仅用于日志提示。
+12. preview_scale_
+功能：预览图缩放比例。当前用缩放图做实时检测和显示，以保证预览流畅性。
+13. window_name_
+功能：预览窗口名称，当前固定为 "Press s to save, q to quit"。
+补充：文件级私有静态变量
+1. g_stop_requested
+功能：全局信号退出标志，用于响应 SIGINT。
+三、私有成员函数
+1. void write_q(const std::string& q_path, const Eigen::Quaterniond& q);
+功能：将四元数写入文本文件。
+参数：
+q_path：四元数输出文件路径。
+q：待保存的四元数。
+说明：写出顺序为 wxyz，而 Eigen::Quaterniond::coeffs() 返回顺序是 xyzw，因此函数内做了顺序重排。
+2. void write_timestamp(const std::string& timestamp_path, std::chrono::steady_clock::time_point timestamp);
+功能：将时间戳写入文本文件。
+参数：
+timestamp_path：时间戳输出文件路径。
+timestamp：待保存的采集时间点。
+说明：保存格式为纳秒整数。
+补充：文件级私有辅助函数
+1. void handle_signal(int);
+功能：SIGINT 信号处理函数，收到中断时将 g_stop_requested 置为 true。
+handeye_calib_node.cpp
+功能：
+- 从采集数据文件夹中批量读取图像、四元数和时间戳样本。
+- 基于相机内参和对称圆点板检测结果，对每张图像执行 solvePnP 解算标定板相对相机位姿。
+- 结合采集时的 IMU/云台姿态，构造手眼标定所需的姿态样本对。
+- 支持两种标定模式：
+handeye：直接求解相机到云台外参；
+robotworld：联合求解相机到云台外参以及标定板到世界坐标系的外参。
+- 以 YAML 片段形式输出手眼标定结果，供 Solver 模块配置使用。
+一、公有接口
+1. HandeyeCalibApp(std::string input_folder, std::string config_path, std::string mode, bool show_detection);
+功能：构造手眼标定应用对象。
+参数：
+input_folder：输入样本文件夹路径，内部包含图像、四元数和时间戳文件。
+config_path：配置文件路径，用于读取相机内参和 rotation_matrix_gimbal_to_imu。
+mode：标定模式，支持 handeye 和 robotworld。
+show_detection：是否显示圆点检测结果。
+2. int run();
+功能：执行手眼标定与位姿解算流程。主要步骤包括：
+- 枚举输入样本；
+- 从配置文件读取相机内参与 gimbal->imu 旋转矩阵；
+- 生成圆点板 3D 模板点；
+- 对每张图像执行圆点板检测；
+- 调用 cv::solvePnP() 求解 target->camera 位姿；
+- 结合四元数求解 gimbal->world 姿态；
+- 按模式调用 cv::calibrateHandEye() 或 cv::calibrateRobotWorldHandEye()；
+- 将求得的相机到云台旋转和平移转换为 YAML 配置片段输出。
+返回值：
+0 表示执行成功；
+1 表示样本为空、有效样本不足或运行失败。
+二、私有成员变量
+1. pattern_config_
+功能：圆点板配置，用于生成 3D 模板点并执行圆点检测。
+2. input_folder_
+功能：输入样本文件夹路径。
+3. config_path_
+功能：配置文件路径，用于读取相机内参与云台到 IMU 的旋转矩阵。
+4. mode_
+功能：标定模式字符串，决定后续使用 calibrateHandEye 还是 calibrateRobotWorldHandEye。
+5. show_detection_
+功能：是否显示检测结果窗口。
+6. window_name_
+功能：检测可视化窗口名称，当前固定为 "handeye_calib_node"。
