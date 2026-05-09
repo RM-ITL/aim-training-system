@@ -1,0 +1,117 @@
+shooter.hpp
+  功能：
+-  负责自瞄链路中的最终开火判定。
+- 从 YAML 中读取近距离/远距离开火容差、距离分界阈值和自动开火使能。
+- 提供两套判火接口：
+  shoot：旧链路判火接口，主要用于 test_node_aimer 这类直接由 Aimer 输出指令的流程。
+  checkfire：当前主链路判火接口，供 Planner 输出控制量后做闭环二次确认。
+- 根据目标距离动态切换开火容差，避免远近距离使用同一套射击窗口。
+- 基于当前指令与云台实际姿态的 yaw/pitch 偏差，判断当前是否允许触发开火。
+  一、公有接口
+1. Shooter(const std::string & config_path);
+参数：
+     config_path：YAML 配置文件路径。
+     功能：读取 Shooter 段下的参数并完成初始化，包括：first_tolerance、second_tolerance、 judge_distance、auto_fire
+  2. bool shoot(const io::GimbalCommand & command, const aimer::Aimer & aimer,  const TargetVariant & target, const Eigen::Vector3d & gimbal_pos);
+     输入：
+     command：当前帧瞄准器输出的云台控制命令，类型为 io::GimbalCommand，其中包含control / shoot / yaw / pitch。
+     aimer：瞄准器实例，用于读取 debug_aim_point 判断当前瞄准点是否有效。
+     target：目标变体，可能是 predict::Target 或 predict::OutpostTarget。
+     gimbal_pos：当前云台姿态向量，在旧测试链路中实际打包的是 (yaw, pitch,
+  roll)。
+     输出：bool，表示当前帧是否允许开火。
+     功能：（旧版开火判定接口）先检查控制使能和自动开火开关，再根据目标距离选择容差，随后结合：
+-      上一帧命令与当前命令的 yaw 差值
+-      当前云台 yaw 与上一帧命令 yaw 的差值
+-      aimer.debug_aim_point.valid
+     共同判断当前是否允许射击。
+     补充：该接口目前主要在 test_node_aimer 中使用，不是 hero / standard3 / sentry主部署链路的主要判火入口。
+  3. bool checkfire(double cmd_yaw, double cmd_pitch, const io::GimbalState & gs, const TargetVariant & target);
+     输入：
+     cmd_yaw：当前希望发送给云台的目标 yaw。
+     cmd_pitch：当前希望发送给云台的目标 pitch。
+     gs：当前云台状态，类型为 io::GimbalState，包含 yaw / pitch / yaw_vel /pitch_vel / bullet_speed / bullet_count。
+     target：目标变体，可能是 predict::Target 或 predict::OutpostTarget。
+     输出：bool，表示当前闭环误差是否足够小，可以允许开火。
+     功能：当前主链路开火确认接口。它根据目标距离选择容差，再计算命令角和当前云台实测角之间的 yaw/pitch 偏差，最后通过归一化误差判断是否放行开火。
+     补充：在 hero.cpp、standard3.cpp、sentry.cpp 中，通常是先由 Planner 给出plan.fire，再执行：plan_result.fire = plan_result.fire && shooter_->checkfire(...) 也就是 Shooter 负责“第二层闭环判火”。
+  二、私有成员变量
+  1. last_command_：上一帧保存的云台命令，类型为 io::GimbalCommand。
+     作用：供 shoot 接口做相邻两帧命令突变检测，并判断当前云台是否已经跟上上一帧命令。
+  2. judge_distance_：距离分界阈值。
+     作用：用于区分“近距离判火容差”和“远距离判火容差”。
+  3. first_tolerance_：近距离开火容差，单位为弧度。
+     作用：当目标距离不超过 judge_distance_ 时，作为判火误差上限。
+  4. second_tolerance_：远距离开火容差，单位为弧度。
+     作用：当目标距离超过 judge_distance_ 时，作为判火误差上限。
+     说明：配置上通常比近距离更严格。
+  5. auto_fire_：自动开火总开关。
+     作用：若为 false，则 shoot 直接拒绝开火。
+  三、开火逻辑说明
+  1. 距离判定逻辑
+     作用：
+     Shooter 不直接使用完整三维距离，而是从目标 EKF 状态中取：
+     ekf_x[0]
+     ekf_x[2]
+     计算平面距离：
+     distance = sqrt(x^2 + y^2)
+     再与 judge_distance_ 比较。
+     判断规则：若距离大于 judge_distance_，使用 second_tolerance_。否则使用 first_tolerance_。
+     补充：远距离目标通常投影更小、误差容忍更低，因此会切换到更严格的容差窗口。
+  2. shoot 的旧链路判火逻辑
+     作用：这是偏“经验型”的开火判据，核心判断条件是：
+     command.control 为真；  （表示当前链路允许控制）
+     auto_fire_ 为真；    （表示系统启用了自动开火）
+     abs(last_command_.yaw - command.yaw) < tolerance * 2        （表示当前帧命令相对上一帧不能发生过大突变，否则认为此时不稳定，不应射击）
+     abs(gimbal_pos[0] - last_command_.yaw) < tolerance         （表示当前云台实际 yaw 应该已经基本跟上上一帧的命令）
+     aimer.debug_aim_point.valid 为真                 （表示瞄准点本身必须有效）
+     补充说明
+     这个旧判据只显式检查了 yaw 稳定性，没有像 checkfire 一样同时检查 pitch 闭环误差。
+     另外，无论本帧是否允许开火，last_command_ 最终都会更新为当前 command，供下一帧使用。
+  3. checkfire 的主链路判火逻辑
+     作用：这是当前正式主链路更关键的开火确认逻辑。
+     核心变量：
+     yaw_offset = cmd_yaw - gs.yaw
+     pitch_offset = cmd_pitch - gs.pitch
+     然后计算：
+     normalized_error = (yaw_offset^2 + pitch_offset^2) / (tolerance^2)
+     判定条件：normalized_error < 1.0则允许开火。
+     几何意义：
+     当前实现虽然注释写的是“normalized error 椭圆判断”，但由于 yaw 和 pitch 共用了同一个 tolerance，所以数学上等价于：
+     以 (cmd_yaw, cmd_pitch) 为目标中心、半径为 tolerance 的二维圆形误差门限。
+     也可以理解为：
+     只有当当前云台实际姿态 (gs.yaw, gs.pitch) 已经进入“允许开火圆域”后，才放行射击。
+  4. yaw_offset 在判火中的两种含义必须区分
+     第一种：Aimer 或 Planner 里的 yaw_offset_ / pitch_offset_
+     作用：这是标定补偿参数，用来补偿相机光心、枪管中心、机构安装误差等系统偏置。
+     例如：
+     Aimer 中最终输出：
+     yaw = atan2(...) + yaw_offset_
+     pitch = -(traj.pitch + pitch_offset_)
+     Planner 中也会在解算结果里加入：
+     yaw_offset_
+     pitch_offset_
+     这类补偿。
+
+ 第二种：Shooter::checkfire 里的局部变量 yaw_offset、pitch_offset
+  作用：
+   它们不是配置参数，而是“当前指令角”和“当前实测角”之间的瞬时闭环误差。
+   即：
+    yaw_offset = cmd_yaw - gs.yaw
+    pitch_offset = cmd_pitch - gs.pitch
+   本质上表示：云台此刻距离目标命令还差多少。
+  
+  结论：Aimer/Planner 的 yaw_offset_ 是“静态补偿量”；Shooter::checkfire 的 yaw_offset 是“动态闭环误差”。
+
+  5. yaw_offset_ 配置如何间接影响开火
+     作用：
+ 虽然 Shooter 自己不读取Aimer.yaw_offset 或Planner.yaw_offset，但这些补偿会先影响最终输出的 cmd_yaw / cmd_pitch。
+     因此如果补偿参数配错就会导致 命令角会整体偏移 -> 云台很难稳定贴合目标 -> cmd_yaw - gs.yaw 和 cmd_pitch - gs.pitch 会长期偏大 -> checkfire 更难满足 < 1.0 的条件。
+     所以从工程上看：yaw_offset_ / pitch_offset_ 配置虽然不在 Shooter 内部判定，但会直接影响Shooter 的放火成功率。
+  6. 当前主链路的两层开火门控
+     第一层：
+     Planner 内部先根据轨迹跟踪误差判断 plan.fire。其核心条件是规划参考轨迹与 MPC 求解结果之间的偏差是否小于 fire_thresh_。（这一层更偏“规划层可射性”）
+     第二层：
+     节点层再调用 shooter_->checkfire(...)，把 plan.fire 与闭环误差判定结果做与运算。也就是说只有规划层认为可射，同时云台当前实际姿态也已经足够接近目标命令角时，最终才真正开火。（ Planner 解决“理论上该不该打”；Shooter 解决“此刻实际能不能打”）
+  7. 与 auto_fire 的关系
+     作用：auto_fire_ 是自动开火的总开关。在旧链路 shoot 中，只要 auto_fire_ == false，函数直接返回 false。在当前主链路里，plan.fire 和 checkfire 决定的是“是否满足技术开火条件”，而是否真的由系统自主触发，还要看外部是否允许自动开火策略生效。
