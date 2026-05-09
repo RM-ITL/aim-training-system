@@ -1,0 +1,71 @@
+full_model.hpp
+  功能：
+- 提供自动瞄准目标跟踪使用的通用扩展卡尔曼滤波器 motion_model::ExtendedKalmanFilter。
+- 维护目标状态向量 x 和协方差矩阵 P。
+- 支持线性预测，以及带自定义状态转移函数的非线性预测。
+- 支持线性观测更新，以及带自定义观测函数的 EKF 更新。
+- 在更新阶段记录残差、NIS、NEES 和最近窗口内的 NIS 失败率，供 Target、OutpostTarget 和 Tracker 做调试与稳定性判定使用。
+一、公有接口
+1. ExtendedKalmanFilter() = default;
+功能：默认构造函数，主要用于对象占位、容器管理和后续赋值初始化，本身不创建有效滤波状态。
+2. ExtendedKalmanFilter(const Eigen::VectorXd& x0, const Eigen::MatrixXd&P0,std::function<Eigen::VectorXd(const Eigen::VectorXd&, const Eigen::VectorXd&)> x_add = [](const Eigen::VectorXd& a, const Eigen::VectorXd& b) { return a + b; });
+功能：使用初始状态和初始协方差构造 EKF，并初始化单位阵和调试统计字段。
+参数：
+x0：初始状态向量。
+P0：初始状态协方差矩阵。
+x_add：状态叠加函数，默认是普通向量加法；当状态中包含角度等周期变量时，可传入自定义函数，在状态更新后做角度归一化。Target 和 OutpostTarget 构造 EKF 时都会通过这个参数处理 θ 的角度回绕。
+3. Eigen::VectorXd predict(const Eigen::MatrixXd& F, const Eigen::MatrixXd& Q);
+功能：执行线性预测。内部默认使用 F * x 作为状态转移结果，并调用另一重载完成协方差推进。
+参数：
+F：状态转移矩阵，同时用于协方差传播。
+Q：过程噪声协方差矩阵。
+返回值：预测后的状态向量 x。
+4. Eigen::VectorXd predict(const Eigen::MatrixXd& F, const Eigen::MatrixXd& Q,std::function<Eigen::VectorXd(const Eigen::VectorXd&)> f);
+功能：执行带自定义状态转移函数的预测。协方差仍按 F 传播，状态本身按外部给定的 f(x) 更新，符合EKF 的“线性化矩阵 + 非线性状态函数”用法。
+参数：
+F：状态转移雅可比或线性化矩阵，用于协方差传播。
+Q：过程噪声协方差矩阵。
+f：状态转移函数，输入旧状态 x，输出预测后的新状态。
+返回值：预测后的状态向量 x。
+5. Eigen::VectorXd update(const Eigen::VectorXd& z, const Eigen::MatrixXd& H, constEigen::MatrixXd& R, std::function<Eigen::VectorXd(const Eigen::VectorXd&, constEigen::VectorXd&)> z_subtract = [](const Eigen::VectorXd& a, const Eigen::VectorXd& b){ return a - b; });
+功能：执行线性观测更新。内部默认使用 H * x 作为观测预测值，并调用另一重载完成完整 EKF 更新。
+参数：
+z：观测向量。
+H：观测矩阵。
+R：观测噪声协方差矩阵。
+z_subtract：观测残差计算函数，默认是普通减法；当观测里包含角度量时，可在该函数中做角度归一化。
+返回值：更新后的状态向量 x。
+6. Eigen::VectorXd update(const Eigen::VectorXd& z, const Eigen::MatrixXd& H, constEigen::MatrixXd& R, std::function<Eigen::VectorXd(const Eigen::VectorXd&)> h,std::function<Eigen::VectorXd(const Eigen::VectorXd&, const Eigen::VectorXd&)> z_subtract = [](const Eigen::VectorXd& a, const Eigen::VectorXd& b) { return a - b; });
+功能：执行完整的 EKF 观测更新。内部计算卡尔曼增益 K，使用 Joseph 形式更新协方差，再用 x_add 叠加状态增量；同时计算残差、NIS、NEES，并更新最近窗口内的 NIS 失败记录。
+补充：
+joseph形式 指的是卡尔曼滤波里更新后验协方差矩阵P的一种写法，相较于传统标准的写法更加严谨。因为更新后的不确定性包括两部分，分别是预测误差经过“观测修正”后剩下的那部分 和 观测噪声经过增益k后传进系统的部分。而传统写法是比较粗暴的直接把不确定性削减掉，joseph严谨在于它是先将预测误差削减，再把观测噪声带来的误差补进更新后的协方差里。
+NIS 和 NEES 都是用来检查卡尔曼滤波“准不准”的一致性指标。
+参数：
+z：观测向量。
+H：观测雅可比或线性化观测矩阵。
+R：观测噪声协方差矩阵。
+h：观测函数，输入当前状态 x，输出预测观测。
+z_subtract：观测残差计算函数，常用于处理角度差值回绕问题。
+返回值：更新后的状态向量 x。
+二：公有成员变量
+1. x：当前滤波状态向量。Target 和 OutpostTarget 会直接读取它来获取中心位置、速度、角速度、半径等状态量。
+2. P：当前状态协方差矩阵，用于评估状态不确定性，也被上层用来判断是否收敛。
+3. data：调试与卡方检验统计数据，类型为 std::map<std::string, double>。当前会维护这些键值：
+  residual_yaw：yaw 残差
+  residual_pitch：pitch 残差
+  residual_distance：distance 残差
+  residual_angle：angle 残差
+  nis：本次更新的 NIS 值
+  nees：本次更新的 NEES 值
+  nis_fail：本次 NIS 是否超阈值
+  nees_fail：本次 NEES 是否超阈值
+  recent_nis_failures：最近滑动窗口内的 NIS 失败率
+4. recent_nis_failures：最近若干次更新的 NIS 失败标记队列，失败记 1，通过记 0。Tracker 会统计这个队列中的失败数，作为异常重置依据。
+5. window_size：NIS 失败率统计窗口大小，默认 100。
+6. last_nis：最近一次更新得到的 NIS 值。
+三、私有成员变量
+1. I：与状态维度一致的单位矩阵，用于 Joseph 形式协方差更新。
+2. x_add：状态叠加函数。它的意义不是简单“加法函数缓存”，而是让滤波器在更新状态时能正确处理角度类状态，例如加完增量后再做角度归一化。
+3. nees_count_：累计 NEES 超阈值次数。
+4. nis_count_：累计 NIS 超阈值次数。
+5. total_count_：累计更新次数。
