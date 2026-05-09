@@ -1,0 +1,38 @@
+solver_node.hpp
+别名类型：
+- ArmorType = armor_auto_aim::ArmorType;
+- ArmorName = armor_auto_aim::ArmorName;
+- Armors = armor_auto_aim::Armor;
+一、公有接口
+1.explicit Solver(const std::string& yaml_config_path);
+功能：加载配置，初始化pnp_solver、coord_converter_、yaw_optimizer_ 
+2.void updateIMU(const Eigen::Quaterniond& q_absolute, double timestamp);
+功能：通过绝对姿态四元数更新坐标系(云台IMU)
+3.void updateIMU(double yaw, double pitch, double timestamp);
+功能：通过yaw,pitch更新坐标系(重载版本）
+4.Armor_pose processArmor(Armors armor, double timestamp);
+功能：输入detect获得的Armor的armor(检测到的装甲板)，进行 PnP 解算，返回其在世界坐标系下的位姿
+总体过程：初始化->提取角点->坐标转换(相机系->云台系->世界系)->(部分装甲板偏航角优化)->计算球坐标，便于云台控制->缓存并返回最终的 Armor_pose
+5. Orientation getCurrentAngles() const { return coord_converter_->getCurrentAngles(); }
+功能：返回当前坐标系角度
+6. PnPResult getLastPnPResult() const { return last_pnp_result_; }
+功能：返回最近一次 PnP 解算的原始结果
+7. Armor_pose getLastpose() const { return last_armor_pose_; }
+功能：返回最近一次解算得到的装甲板完整位姿
+8.CoordConverter* getCoordConverter() { return coord_converter_.get(); }
+功能：返回坐标转换器裸指针
+9.YawOptimizer* getYawOptimizer() { return yaw_optimizer_.get(); }
+功能：返回偏航优化器裸指针
+二、私有成员变量
+1. pnp_solver_：PnP 解算器，将装甲板的图像关键点转换为相机坐标系下的位姿
+2. coord_converter_：坐标转换器，负责 IMU 与相机之间的坐标系变换
+3. yaw_optimizer_：偏航角优化器，可结合历史信息优化偏航角度，提供重投影函数
+4. last_armor_pose_：缓存最近一次成功解算的装甲板位姿
+5. last_pnp_result_：缓存最近一次 PnP 解算的原始结果
+三、私有成员函数
+1.ArmorName parseArmorNumber(int number) const;
+功能：将检测到的数字编号转换为 ArmorName 枚举(1->one)
+2.ArmorType parseArmorType(const std::string& type_str) const;
+功能：将字符串（"big" / "small"）转换为 ArmorType 枚举(大小类型装甲板)
+3.std::vector<cv::Point2f> extractCorners(Armors& armor) const;
+功能：从 Armor 对象中提取四个角点，供 PnP 解算使用
