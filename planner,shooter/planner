@@ -1,0 +1,75 @@
+核心数据类型与常量
+1. DT:MPC 预测步长，=0.01即 100Hz 控制频率
+2. HALF_HORIZON:50 预测步数和半区间，覆盖前后约 0.5秒的轨迹
+3. HORIZON:100HORIZON * DT = 1.0 秒
+4. Trajectory:4×100 矩阵
+5. TargetVariant:支持普通装甲板与哨兵目标类型的联合体（std::variant）
+结构体 Plan
+1.  control：是否启用云台控制
+2. fire ：是否允许开火
+3. target_yaw：理想瞄准点的偏航角（弧度）
+4. target_pitch ：理想瞄准点的俯仰角（弧度）
+5. yaw:实际发送给云台的目标偏航角（弧度）
+6. yaw_vel:偏航角速度前馈（rad/s）
+7. yaw_acc:偏航角加速度前馈（rad/s²）
+8. pith:实际发送给云台的目标俯仰角（弧度）
+9. pitch_vel:俯仰角速度前馈（rad/s）
+10. pitch_acc:俯仰角加速度前馈（rad/s²）
+一、公有接口
+1.debug_xyza
+功能：用于存储当前瞄准目标的关键调试信息，在 aim() 函数中被赋值为最接近的装甲板候选的世界位置和偏航角，供 外部模块（如主循环的调试发布或可视化）读取，方便实时监控 Planner 正在瞄准的目标。
+2.Planner(const std::string & config_path);
+功能：构造函数，从 YAML 配置文件中加载偏航/俯仰偏移、射击阈值、延迟时间等参数，并初始化偏航和俯仰的 TinySolver
+从 YAML 文件中加载 Planner 节点下的参数：
+- yaw_offset_, pitch_offset_：云台零点与目标几何中心的偏置（弧度）。
+- fire_thresh_：允许开火的最大角度误差阈值（弧度）。
+- low_speed_delay_time_, high_speed_delay_time_：两种弹速下的系统延迟补偿时间（秒）。
+- decision_speed_：区分高低弹速的界线（弧度/秒，目标的角速度）。
+调用 setup_yaw_solver 和 setup_pitch_solver 初始化偏航与俯仰的 MPC 求解器。
+3.Plan plan(predict::Target target, double bullet_speed);
+功能：针对单个 Target 的规划接口，用于常规装甲板
+流程：弹速合法性检查->子弹飞行时间计算->生成参考轨迹 Trajectory(生成一个 4×100 的矩阵 traj)->偏航与俯仰 MPC 求解->填充 Plan 结构体
+调用 get_trajectory(target, yaw0, bullet_speed) 生成的traj中是未来 100 步的：
+- 行0: 偏航角偏差yaw0
+- 行1: 偏航角速度
+- 行2: 俯仰角pitch
+- 行3: 俯仰角速度
+- get_trajectory 内部通过中心差分计算角速度
+4.Plan plan(std::optional<predict::Target> target, double bullet_speed);
+功能：处理可能为空的目标：若目标存在则调用上一个版本，否则生成“待命”或“归零”指令
+5.Plan plan(predict::OutpostTarget target, double bullet_speed);
+功能：针对前哨站目标（OutpostTarget）的专用规划接口
+6. Plan plan(TargetVariant target, double bullet_speed);
+功能：统一规划接口，通过 TargetVariant（std::variant<Target, OutpostTarget>）自动分发到对应的处理函数。
+7.Plan plan(std::optional<TargetVariant> target, double bullet_speed);
+功能：处理可能为空的目标变体。
+二、私有成员变量
+1. yaw_offset_;偏航角的固定偏置
+2. pitch_offset_:俯仰角的固定偏置
+3. fire_thresh_:允许开火的角度误差阈值（当瞄准误差小于该值时可开火）
+4. low_speed_delay_time_, high_speed_delay_time_, decision_speed_:低弹速下的系统延迟补偿时间、高弹速下的系统延迟补偿时间、区分高低弹速的临界弹速阈值
+5. yaw_solver_:指向偏航轴 MPC 求解器的首指针
+6. pitch_solver_:指向俯仰轴 MPC 求解器的首指针
+三、私有成员函数
+1.setup_yaw_solver(const std::string & config_path);
+功能：从配置文件读取偏航轴的 MPC 参数，设置 yaw_solver_
+2.setup_pitch_solver(const std::string & config_path);
+功能：从配置文件读取俯仰轴的 MPC 参数，设置 pitch_solver_
+3. Eigen::Matrix<double, 2, 1> aim(const predict::Target & target, double bullet_speed);
+功能：针对普通 Target 计算瞄准角度（偏航、俯仰），内部结合目标状态与弹速进行轨迹预测
+4.Trajectory get_trajectory(predict::Target & target, double yaw0, double bullet_speed);
+功能：为普通 Target 生成云台随动轨迹（yaw, yaw_vel, pitch, pitch_vel），用于 MPC 的连续控制
+5.Eigen::Matrix<double, 2, 1> aim(const predict::OutpostTarget & target, double bullet_speed);
+功能：针对前哨站目标计算瞄准角度
+6.Trajectory get_trajectory(predict::OutpostTarget & target, double yaw0, double bullet_speed);
+功能：为前哨站目标生成随动轨迹
+整体流程：
+Plan::plan(Target, bullet_speed)
+│
+├─ 选择最近装甲板 xyza
+├─ 计算子弹飞行时间 (utils::Trajectory)
+├─ target.predict(fly_time)  [打未来点]
+├─ aim(target, bullet_speed) → 当前时刻瞄准角
+├─ get_trajectory(target, yaw0, bullet_speed) → 100步参考轨迹
+├─ 分别求解偏航、俯仰 MPC → 最优角度/速度/加速度
+└─ 填充 Plan{control, fire, yaw, pitch, vel, acc}
