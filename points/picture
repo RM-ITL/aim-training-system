@@ -1,0 +1,86 @@
+image_processor.hpp
+  功能：
+- 负责 pointer 分支中 ROI (感兴趣区域)图像的预处理（包括灰度化、二值化处理）
+- 在灯条配对完成后，对 ROI 中的灯条区域进行 HSV 颜色判别，输出红、蓝、紫或未知颜色。
+一、公有接口
+1. void load_from_yaml(const std::string& yaml_path);
+功能：读取 pointer.binary、pointer.color、pointer.channel、pointer.method 下的参数，初始化图像预处理配置。
+参数：yaml_path：YAML 配置文件路径。
+说明：这是 ImageProcessor::Config 的接口，不是 ImageProcessor 本体成员函数；加载失败时保留默认参数。
+2. explicit ImageProcessor(const Config& config);
+功能：使用外部传入配置构造图像处理器。
+参数：config：图像预处理配置对象。
+3. ImageProcessor();
+功能：使用默认配置构造图像处理器。
+4. cv::Mat process_roi(const cv::Mat& roi, ArmorColor enemy_color, GrayMethod gray_method = GRAY_CVT, BinaryMethod binary_method = BINARY_HISTOGRAM);
+功能：先调用灰度化接口，再调用二值化接口，输出当前 ROI 的二值化结果。
+输入：
+roi：待处理的 BGR ROI 图像。enemy_color：敌方颜色先验，用于决定颜色相关灰度化策略。
+gray_method：灰度化方法枚举。binary_method：二值化方法枚举。
+输出：二值图 cv::Mat。
+5. cv::Mat get_gray_image(const cv::Mat& input, ArmorColor enemy_color, GrayMethod method);
+功能：统一分发灰度化逻辑，根据枚举选择 gray_cvt、gray_channel、gray_subtract、gray_hsv、gray_mix 之一。
+输入：
+input：原始 BGR 图像。
+enemy_color：颜色先验。
+method：灰度化方法。
+输出：灰度图 cv::Mat。
+6. cv::Mat get_binary_image(const cv::Mat& gray, BinaryMethod method);
+功能：统一分发二值化逻辑，根据枚举选择固定阈值、直方图阈值、OTSU 或均值阈值方法。
+输入：
+gray：灰度图。
+method：二值化方法。
+输出：二值图 cv::Mat。
+7. ArmorColor detect_armor_color(const cv::Mat& roi, const std::pair<Lightbar, Lightbar>& lightbar_pair);
+功能：将 ROI 转为 HSV，在两根灯条的扩展区域内统计红、蓝、紫像素数量，输出最终颜色结果。
+输入：
+roi：原始 BGR ROI。
+lightbar_pair：已匹配好的左右灯条对。
+输出：装甲板颜色枚举 ArmorColor。
+二、私有成员变量
+1. config_：图像预处理参数集合。
+作用：保存二值化阈值、通道权重、默认灰度化方法、默认二值化方法等配置。
+补充：
+Config 中的重要参数包括：
+binary_threshold_ratio：阈值偏移量。
+histogram_cut_threshold：直方图法的截止阈值。
+fixed_threshold：固定阈值法的阈值。
+channel_weight_r/g/b：通道差分时的权重。
+default_gray_method：默认灰度化方法。
+default_binary_method：默认二值化方法。
+enemy_color_threshold：已读取但当前主流程未实际使用。
+三、私有成员函数
+1. 灰度化处理
+cv::Mat gray_cvt(const cv::Mat& input);
+cv::Mat gray_channel(const cv::Mat& input, ArmorColor color);
+cv::Mat gray_subtract(const cv::Mat& input, ArmorColor color);
+cv::Mat gray_hsv(const cv::Mat& input, ArmorColor color);
+cv::Mat gray_mix(const cv::Mat& input, ArmorColor color);
+作用：
+gray_cvt：标准 BGR -> Gray。
+gray_channel：按颜色提取单通道，蓝取 B，红取 R，紫取 B/R 均值。
+gray_subtract：做颜色差分抑制过曝和背景干扰，当前 pointer 主流程优先使用它。
+gray_hsv：在 HSV 空间按色相范围做掩码，再保留 V 通道亮度。
+gray_mix：紫色走 HSV，红蓝走单通道，未知颜色退化为普通灰度。
+2. 二值化处理
+cv::Mat binary_fixed(const cv::Mat& gray);
+cv::Mat binary_histogram(const cv::Mat& gray);
+cv::Mat binary_otsu(const cv::Mat& gray);
+cv::Mat binary_mean(const cv::Mat& gray);
+作用：
+binary_fixed：使用固定阈值二值化。
+binary_histogram：先根据灰度直方图找阈值，再二值化。
+binary_otsu：使用 OTSU 自动阈值。
+binary_mean：使用均值加偏移量作为阈值。
+3. 阈值辅助
+int calculate_histogram_threshold(const cv::Mat& gray);
+输入：gray：灰度图。
+输出：整型阈值。
+作用：计算灰度直方图，从高灰度区间向下扫描，找到满足 histogram_cut_threshold 的阈值点，再叠加 binary_threshold_ratio，最后将结果限制在合理范围内。
+4. 颜色判别细节
+作用：detect_armor_color 内部会过滤低饱和度和极端亮度像素，然后依据 HSV 色调区间
+做像素计数：
+蓝色：100~124
+红色：0~10 或 156~180
+紫色：125~155
+最后根据票数关系输出 ARMOR_COLOR_BLUE / RED / PURPLE / NONE。
