@@ -1,0 +1,257 @@
+CalibParam:  
+  # 内参校准参数（已更新）
+  INTRI:
+    Camera:
+      - key: /image_topic
+        value:
+          polymorphic_id: 2147483649          #相机模型的编号
+          polymorphic_name: pinhole_brown_t2  #相机模型的类型名
+          ptr_wrapper:                        #一个指针，用于保存下列的参数
+            id: 2147483650
+            data:
+              img_width: 1280
+              img_height: 1024
+              focal_length:                     # 8mm相机
+                - 1981.2223421535
+                - 1986.1494917524
+              principal_point:
+                - 620.9395080196
+                - 523.2526449055
+              disto_param:
+                - -0.0763006611
+                - -0.1161953446
+                - 0.0016647627
+                - -0.0012201617
+                - 0.0000000000
+              # focal_length:                     # 6mm相机
+              #   - 1330.649408921195
+              #   - 1332.3006999890033
+              # principal_point:
+              #   - 627.2791611048931
+              #   - 533.2806702069377
+              # disto_param:
+              #   - -0.14828277112729327
+              #   - 0.7868245788660153
+              #   - 0.0023478362007317123
+              #   - 0.002535817596959765
+              #   - -1.5222934363748177
+              # focal_length:                   # 4mm相机
+              #   - 893.4306170676092
+              #   - 888.878979439582
+              # principal_point:
+              #   - 618.4622245880115
+              #   - 511.73226091888046
+              # disto_param:
+              #   - -0.09613598816721357
+              #   - 0.3686128765511766
+              #   - -0.0035685183642176046
+              #   - 0.002876545526120485
+              #   - -0.594006385480322
+  
+
+# 相机参数
+camera:
+  type: "mindvision"  # 可选: "hik", "mindvision"
+  parameters:
+    exposure_ms: 8.0  # 曝光
+    gain: 14.0        # 增益
+    gamma: 1.0      # MindVision的gamma
+    fps: 120.0        # 海康的帧率
+    target_width: 1280
+    target_height: 1024
+    image_topic: "image_topic"
+    vid_pid: "2bdf:0283"  # MindVision相机的VID:PID（相机编号）
+    debug: false         #调试模式开关
+
+# 神经网络识别参数
+yolo:
+  yolo_name: "yolov5"  # 可选: "yolo11", "yolov5"
+  yolo11_model_path: "src/model/yolo11.xml"    #模型路径
+  yolov5_model_path: "src/model/yolov5.xml"
+  # 推理设备
+  device: "CPU"  # 可选: CPU, GPU, MYRIAD
+  enemy_color: "red"    #敌方颜色
+  # 检测阈值
+  min_confidence: 0.8    #最小置信度
+  score_threshold: 0.7   #分数阈值
+  nms_threshold: 0.3     #重合阈值（目标框重合比大于0.3,删除score低的框）
+  use_traditional: true  #传统视觉开关
+
+# 传统方法识别（装甲板灯条检测）参数：
+# 参数解析
+classify_model: "src/model/tiny_resnet.onnx"
+threshold: 150  # 固定阈值二值化的阈值
+max_angle_error: 45 # degree，灯条最大角度误差
+min_lightbar_ratio: 1.5 # 灯条最小宽高比
+max_lightbar_ratio: 20  # 灯条最大宽高比
+min_lightbar_length: 8  # 灯条的最小长度像素
+min_armor_ratio: 1      # 装甲板最小宽高比
+max_armor_ratio: 5      # 装甲板的最大宽高比
+max_side_ratio: 1.5     # 左右灯条的长度比上限
+max_rectangular_error: 20 # degree，最大灯条的长度比上限
+min_confidence: 0.8     # 分类器的最小置信度
+
+# DM_IMU相关配置
+DM_IMU:
+# 串口配置
+imu_com_port: "/dev/ttyACM1"    #串口设备文件路径
+baud: 115200              #串口波特率（需与下位机保持一致）
+
+# 发布频率相关
+publish_rate: 1000  # Hz
+  
+
+# 坐标系配置
+# 相机坐标系即标准的相机坐标系，以相机为视角向前看，向前是Z轴正向，向右是X轴正向，向下是Y轴正向，左手坐标系
+# 变换之后的云台坐标系，向前是X轴正向，向上是Z轴正向，向左是Y轴正向，右手系
+
+# 电控坐标系定义：向云台方向看
+# 向前为X轴正向，向左为Y轴正向，向上为Z轴，Pitch轴抬头为负数，低头为正数，yaw向左为正数，向右为负数
+
+# 解算模块所需的参数
+Solver:
+  coord_converter:  # 坐标变换所需参数
+    rotation_matrix_camera_to_gimbal:   #相机坐标系->云台坐标系
+      rows: 3                           #矩阵行数
+      cols: 3                           #矩阵列数
+      dt: float                         #数据类型  
+      data: [0, 0, 1,
+            -1, 0, 0,
+            0, -1, 0]
+
+    # rotation_matrix_gimbal_to_imu:    #云台坐标系->imu坐标系
+    #   rows: 3
+    #   cols: 3
+    #   dt: float
+    #   data: [1, 0, 0,
+    #         0, 1, 0,
+    #         0, 0, 1]
+    rotation_matrix_gimbal_to_imu:   #云台坐标系->imu坐标系
+      rows: 3
+      cols: 3
+      dt: float
+      data: [1, 0, 0,
+            0, 1, 0,
+            0, 0, 1]
+
+# 陀螺仪与相机放置在同一位置
+# - x: 相机相对云台在前后方向的偏移
+# - y: 相机相对云台在左右方向的偏移
+# - z: 相机相对云台在上下方向的偏移
+
+t_camera_to_gimbal:               #相机相对于云台的安装偏移距离
+[0.00, 0.055, 0.00]               #左偏0.055m
+
+# Tracker参数
+Tracker:
+  enemy_color: "red"  # 或 "blue"
+  # 跟踪状态机参数
+  min_detect_count: 3              # 最小检测次数
+  max_temp_lost_count: 10          # 普通目标的最大临时丢失容忍度
+  outpost_max_temp_lost_count: 30  # 前哨站的最大临时丢失容忍度
+  # 前哨站特化参数
+  outpost_min_detect_count: 3      # 前哨站的最小检测次数（更快进入tracking）
+  outpost_detect_fail_tolerance: 8  # 前哨站在detecting状态允许的连续失败帧数
+  # 单板观测模式参数
+  single_plate_threshold: 50       # 连续无板切换帧数超过此值进入单板模式
+  omega_threshold: 0.5             # rad/s，角速度低于此值时才允许进入单板模式
+
+# 瞄准器Aimer参数
+Aimer:
+  #####-----aimer参数-----#####
+  yaw_offset: -0.8 # degree -2.5        #yaw轴偏移角度
+  pitch_offset: -1  # degree 2          #pitch轴偏移角度
+  comming_angle: 60 # degree            #目标和当前云台角度差<60度->认定为靠近目标
+  leaving_angle: 20 # degree            #角度差>20 度 → 退出靠近，正常跟踪
+  left_yaw_offset: -1                   #目标在左边，额外左偏角度
+  right_yaw_offset: -0.6
+  decision_speed: 10 # rad/s            #目标速度判断阈值（大于10->高速目标）
+  high_speed_delay_time: 0.026 # s      #高速目标延迟时间（预测提前时间）
+  low_speed_delay_time: 0.010 # s       #非高速...
+
+#####-----shooter参数-----#####
+Shooter:
+  first_tolerance: 3 # 近距离射击容差，degree
+  second_tolerance: 2 # 远距离射击容差，degree
+  judge_distance: 2 #距离判断阈值
+  auto_fire: true # 是否由自瞄控制射击
+
+# planner调参：
+
+  #| 参数              | 作用         | 调节方向 | 目的            |
+  #|-------------------|--------------|----------|-----------------|
+  #| fire_thresh       | 开火阈值     | ↓ 减小   | 给PID误差留余量 |
+  #| max_yaw/pitch_acc | 加速度限制   | ↓ 减小   | 轨迹更平滑      |
+  #| Q                 | 位置跟踪权重 | ↓ 减小   | 不那么急于跟踪  |
+  #| R                 | 控制平滑权重 | ↑ 增大   | 输出更平滑      |
+  #| delay_time        | 预测提前量   | ↑ 增大   | 补偿PID延迟     |
+
+###planner参数###
+Planner:
+  fire_thresh: 0.0015 # 允许开火阈值，值越小要求精度越高，代表着实际角度和规划角度之间的误差
+  max_yaw_acc: 50 # 最大Yaw加速度上限
+  Q_yaw: [9e6, 0] # 状态权重矩阵Q的对角线元素：[位置权重, 速度权重]。
+  # 9e6的高位置权重意味着强调精确跟踪目标角度，速度权重为0表示不惩罚速度偏差 
+  R_yaw: [1]
+  max_pitch_acc: 100  # 最大pitch加速度上限
+  Q_pitch: [9e6, 0]
+  R_pitch: [1]
+  yaw_offset: 0 # degree，相机光心与枪管中心的yaw偏差
+  pitch_offset: 0 # degree，pitch相对枪管的中心补偿参数
+  decision_speed: 7 # rad/s， 高低速的判断阈值，大于此值的为高速目标
+  high_speed_delay_time: 0.0 # s，高速目标的额外时间补偿
+  low_speed_delay_time: 0.0 # s，低速目标的额外时间补偿
+
+  # 延迟补偿参数
+  decision_speed: 7              # rad/s，高低速判断阈值
+  high_speed_delay_time: 0.03    # s，高速目标系统延迟
+  low_speed_delay_time: 0.01     # s，低速目标系统延迟
+
+  # 迭代收敛参数
+  max_fly_time_iterations: 5     # 飞行时间迭代最大次数
+  fly_time_convergence_thresh: 0.002  # s，收敛阈值
+
+# Gimbal通讯参数
+Gimbal:
+enable_serial: true            #串口通讯开关
+# com_port: "/dev/ttyUSB0"
+com_port: "/dev/ttyACM0"
+com_port_1: "/dev/ttyACM2"
+
+# 校正下位机的四元数 [x, y, z, w], q_corrected = q_calib * q_lower
+# q_calib:
+#   x: 0.01168210
+#   y: 0.06258915
+#   z: -0.02122380
+#   w: 0.99774530
+
+# q_calib:
+#   x: 1.0000
+#   y: 1.0000
+#   z: 1.0000
+#   w: 1.0000
+
+# video视频测试参数
+Video:
+video_path: "test/buff_simulation_record.mp4"
+
+#####-----buff_detector参数-----#####
+buff_model: "src/model/yolo11_buff_int8.xml"
+
+#####-----buff_aimer参数-----#####
+fire_gap_time: 0.700   # s        #射击间隔时间
+predict_time: 0.120     # s       #预测时间
+  
+# 基地Base识别参数
+Base_Hit:
+  Openvino_XML: src/model/Katrin.xml
+  Openvino_Deveice: "CPU"
+  input_width: 640
+  input_height: 384
+  score_threshold: 0.8
+  nms_threshold: 0.3
+
+# 光条追踪器 LightTracker 参数
+LightTracker:
+  min_detect_count: 3           # 最小检测次数（detecting → tracking）
+  max_temp_lost_count: 10       # 最大临时丢失次数（temp_lost → lost）
