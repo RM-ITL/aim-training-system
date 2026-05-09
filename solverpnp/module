@@ -1,0 +1,42 @@
+module.hpp下含有coord_converter.hpp、optimize_yaw.hpp、pnp_solver.hpp、solver.hpp
+1.coord_converter.hpp
+功能：CoordConverter 类是整个模块的坐标系变换中枢，内部维护了各个坐标系之间的旋转与平移关系，并能够根据实时的 IMU 姿态动态更新。
+核心函数：
+1.void updateIMU(const Eigen::Quaterniond& q_absolute, double timestamp);和void updateIMU(double yaw, double pitch, double timestamp);
+功能：这两者用于实时更新世界对齐矩阵（R_imu_to_world_ 或 R_gimbal_to_world），使得世界系下的目标位置保持稳定。
+2.Eigen::Vector3d transform(const Eigen::Vector3d& point, CoordinateFrame from, CoordinateFrame to);和Eigen::Matrix3d transformRotation(const Eigen::Matrix3d& rotation, CoordinateFrame from, CoordinateFrame to);
+功能：作为点与旋转的统一变换接口，屏蔽了底层复杂的旋转链，调用者只需指定 CAMERA → GIMBAL 或 CAMERA → WORLD 等，只针对接口。
+2.optimize_yaw.hpp
+功能：作为偏航角优化器
+核心函数：
+Eigen::Matrix3d optimize_yaw(
+        const Eigen::Vector3d& world_position,
+        const Eigen::Matrix3d& R_armor_to_world,
+        ArmorType armor_type,
+        ArmorName armor_name,
+        const std::vector<cv::Point2f>& detected_corners,
+        const CoordConverter& converter);
+功能：负责调整装甲板在世界坐标系下的偏航角，使重投影误差最小化。
+整体流程：提取原始欧拉角->设定固定的pitch和roll假设->构建初始候选旋转矩阵->计算初始候选的重投影误差->一维搜索最佳偏航角->保存并返回最优结果
+3.pnp_solver.hpp
+功能：是 Solver 模块的底层计算单元，负责将二维图像角点转化为装甲板在相机坐标系下的位姿。
+核心函数：solver::PnPResult solvePnP(const std::vector<cv::Point2f>& corners,ArmorType armor_type,double timestamp = 0.0);
+输入：装甲板的四个图像角点（需按固定顺序），以及装甲板类型（决定物理尺寸使用 PW_SMALL 或 PW_BIG）
+输出：PnPResult包含
+- camera_position：相机系下的三维坐标
+- R_armor_to_camera：装甲板坐标系到相机坐标系的旋转矩阵。
+- camera_spherical：球坐标形式。
+- reprojection_error：重投影误差
+关键参数：camera_matrix_、dist_coeffs_(从配置里传入)
+camera_matrix_：相机内参矩阵
+dist_coeffs_：畸变系数
+4.solver.hpp公共数据结构
+功能：定义了整个 Solver 模块共享的数据类型、常量和枚举
+1. PW_SMALL/PW_BIG:装甲板物理尺寸常量,大小装甲板的角点三维坐标，定义在装甲板本地坐标系下（x=0 平面）
+2. EulerOrder：欧拉角旋转顺序（YXZ, ZYX）
+3. YawPitch：云台偏航/俯仰角度和时间戳
+4. SphericalCoord：球坐标（方位角、俯仰角、距离），支持从笛卡尔坐标构造
+5. Orientation：目标姿态（yaw/pitch/roll）
+6. Armor_pose：最终的装甲板多坐标系位姿（相机/云台/世界系下的位置、姿态、球坐标）
+7. PnPResult：PnP 解算原始结果
+8. Gimbal：云台当前角度与目标角度
