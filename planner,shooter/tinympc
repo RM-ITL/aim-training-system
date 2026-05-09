@@ -1,0 +1,16 @@
+Tinympc包含admm.hpp、codegen.hpp、error.hpp、rho_benchmark.hpp、tiny_api.hpp、tiny_api_constants.hpp、types.hpp
+这些是 TinyMPC 库的头文件，为 Planner 提供超轻量、高速的模型预测控制（MPC）求解能力，专门用于实时生成平滑的云台随动轨迹。(主要是调用)
+1.admm.hpp
+功能：算法核心，声明了 ADMM 交替方向乘子法的内部步骤（forward_pass、backward_pass_grad、project_soc 等）
+2.codegen.hpp
+功能：可将配置好的求解器导出为纯 C 代码，便于嵌入式平台部署
+3.error.hpp
+功能：跨平台的错误打印宏，用于调试
+4.rho_benchmark.hpp
+功能：自适应惩罚参数 rho 的基准测试工具，用于评估不同 rho 值或自适应策略对 ADMM 收敛速度、精度的影响，辅助调参
+5.tiny_api.hpp
+功能:核心用户接口，声明了求解器的初始化 (tiny_setup)、在线求解 (tiny_solve)、设置当前状态/参考轨迹、配置边界与锥约束等全部对外函数
+6.tiny_api_constants.hpp
+功能:定义 API 相关的常量，如默认绝对/对偶容差、最大迭代次数、边界/锥约束使能标志等，供求解器初始化和运行时使用
+7.types.hpp
+功能：定义所有核心数据类型（TinySolver、TinyWorkspace、动态矩阵向量等），是整个库的基础
