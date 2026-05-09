@@ -1,0 +1,111 @@
+ lightbar_detector.hpp
+  功能：
+- 负责 pointer 分支中基于检测框 ROI 的灯条提取、筛选、配对和四点生成。
+- 调用 ImageProcessor 对 ROI 进行灰度化和二值化。
+- 通过轮廓、最小外接旋转矩形、长宽比、面积、角度等条件筛选有效灯条。
+- 对灯条对进行几何约束匹配，输出装甲板四角点、颜色、置信度和调试二值图。
+一、公有接口
+1. void load_from_yaml(const std::string& yaml_path);
+功能：读取 pointer.roi、pointer.lightbar、pointer.match、pointer.refine 下的参数，初始化灯条检测配置。
+参数：yaml_path：YAML 配置文件路径。
+说明：这是 LightbarDetector::Config 的接口；当前仓库主配置文件里未明显看到pointer 参数块，实际运行可能仍依赖默认值。
+2. explicit LightbarDetector(const Config& config);
+功能：使用外部配置构造灯条检测器。
+参数：config：灯条检测配置对象。
+说明：当前实现里虽然保存了 config_，但内部 image_processor_ 仍是用默认ImageProcessor::Config() 构造的。
+3. LightbarDetector();
+功能：使用默认参数构造灯条检测器。
+4. PointerResult process(const cv::Mat& image, const cv::Rect& detection_box, ArmorColor enemy_color);
+输入：
+image：原始 BGR 图像。
+detection_box：上游检测器给出的目标框。
+enemy_color：敌方颜色先验。
+输出：
+PointerResult，包含：
+four_points：四个角点。
+detected_color：最终识别颜色。
+success：是否成功。
+confidence：配对置信度。
+binary_image：当前 ROI 的二值图。
+功能：完整执行 pointer 分支流程：
+- 检测框裁剪 ROI
+- 调用 ImageProcessor 做灰度化和二值化
+- 提取灯条轮廓
+- 做灯条筛选和配对
+- 识别颜色
+- 细化上下端点
+- 生成四角点并恢复到原图坐标系
+说明：当前实现中主流程固定使用：
+GRAY_SUBTRACT
+BINARY_HISTOGRAM
+并没有走配置里的默认方法。
+二、私有成员变量
+1. config_：灯条检测参数集合。
+功能：保存 ROI 扩展比例、灯条筛选阈值、配对阈值、端点细化半径比例等参数。
+2. image_processor_：图像预处理器实例。
+功能：负责 ROI 的灰度化、二值化和颜色判别。
+3. original_detection_box_：原始检测框。
+功能：保存相对于整图的输入检测框。
+4. detection_box_in_roi_：ROI 内部的检测框。
+功能：将原始检测框映射到 ROI 局部坐标系，用于做灯条重叠和配对约束。
+5. roi_offset_：ROI 相对整图的偏移。
+功能：在四点生成后把局部坐标补偿回整图坐标。
+补充：
+Config 中的重要参数包括：
+roi_extend_width_ratio / roi_extend_height_ratio：ROI 扩展比例。
+lightbar_min_ratio / lightbar_max_ratio：灯条长宽比阈值。
+lightbar_min_area：灯条最小面积。
+min_overlap_ratio：灯条与检测框最小重叠比例。
+max_angle_diff：灯条配对最大角度差。
+max_length_ratio：灯条配对最大长度比。
+require_center_in_box：是否要求配对中心在检测框内。
+point_refine_radius_ratio：端点重心细化半径比例。
+三、私有成员函数
+1. ROI 处理
+cv::Rect expand_roi(const cv::Rect& box, const cv::Size& image_size);
+功能：按配置比例对检测框做适度扩展，并裁剪到图像边界内。
+说明：当前 process 中没有真正调用它，而是直接把 detection_box 当 ROI 用。
+2. 灯条提取
+std::vector<Lightbar> find_lightbars_with_constraint(const cv::Mat&
+binary);
+功能：先 findContours 找轮廓，再对每个轮廓做 minAreaRect，提取灯条角度、长度、长宽比和面积，并按阈值筛掉不合格候选。
+输入：binary：ROI 二值图。
+输出：有效灯条列表。
+3. 灯条与检测框关联约束
+bool is_lightbar_valid_for_detection(const Lightbar& lightbar);
+功能：检查灯条外接框与 detection_box_in_roi_ 的关系。若有交集，则要求重叠比例不低于 min_overlap_ratio。若无交集，则允许在“扩展检测框”附近的灯条保留，避免框太紧导致灯条被误删。
+输入：lightbar：候选灯条。
+输出：是否有效。
+4. 灯条配对
+std::pair<Lightbar, Lightbar> match_lightbars_with_constraint(const
+std::vector<Lightbar>& lightbars);
+输入：lightbars：有效灯条列表。
+输出：最佳灯条对。
+功能：遍历所有可能灯条对，检查：
+- 角度差
+- 长度比
+- 中心距离与平均长度的宽高比
+- 配对中心是否落在检测框中
+满足硬约束后，再计算综合得分，选取得分最小的一对
+5. 置信度计算
+double calculate_confidence(const std::pair<Lightbar, Lightbar>&
+matched_pair);
+功能：以 0.8 为基础分，根据灯条角度差和长度比做加权修正，最终限制在 1.0 以内。
+输入：matched_pair：匹配成功的灯条对。
+输出：置信度
+6. 端点细化
+PointPair refine_endpoints(const Lightbar& lightbar, const cv::Mat& gray);
+功能：先对灯条轮廓做 cv::fitLine 拟合直线；再根据投影距离找出两个粗略端点；再在端点邻域内用灰度重心法做精细修正；最后按 y 坐标区分上下端点。
+输入：
+lightbar：单根灯条。
+gray：ROI 灰度图。
+输出：PointPair，包含上端点和下端点。
+7. 四点生成
+std::vector<cv::Point2f> generate_four_points(const PointPair& pp1, const
+PointPair& pp2);
+功能：根据两根灯条中心 x 坐标判断左右顺序，统一输出：左上、右上、右下、左下 的角点顺序，便于后续 PnP 或装甲板姿态解算使用。
+输入：pp1、pp2：两根灯条的上下端点对。
+输出：四个装甲板角点。
+8. 图像处理主链路说明
+功能：process 内部的图像处理顺序是：
+原图 image-> 按 detection_box 裁 ROI-> ImageProcessor::process_roi-> 二值图 binary-> 轮廓提取-> 灯条筛选-> 灯条配对-> HSV 颜色识别-> 灰度端点细化-> 四点生成-> 坐标补偿回原图
